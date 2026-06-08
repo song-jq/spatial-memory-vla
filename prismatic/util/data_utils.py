@@ -106,6 +106,7 @@ class PaddedCollatorForActionPrediction:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
+        timesteps = [instance.get("timestep", idx) for idx, instance in enumerate(instances)]
 
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -150,7 +151,16 @@ class PaddedCollatorForActionPrediction:
             attention_mask=attention_mask,
             labels=labels,
             actions=actions,
+            timesteps=torch.as_tensor(timesteps, dtype=torch.long),
         )
+        if "depth_map" in instances[0]:
+            depth_maps = [torch.as_tensor(instance["depth_map"], dtype=torch.float32) for instance in instances]
+            output["depth_maps"] = torch.stack(depth_maps)
+        if "depth_map_wrist" in instances[0]:
+            depth_maps_wrist = [
+                torch.as_tensor(instance["depth_map_wrist"], dtype=torch.float32) for instance in instances
+            ]
+            output["depth_maps_wrist"] = torch.stack(depth_maps_wrist)
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
         return output

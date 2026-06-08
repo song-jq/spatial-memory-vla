@@ -5,11 +5,16 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import draccus
 import torch
@@ -28,6 +33,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
 
+from action_model.action_model import ActionModel
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
@@ -44,6 +50,7 @@ from prismatic.models.projectors import (
     NoisyActionProjector,
     ProprioProjector,
 )
+from prismatic.models.spatial_memory_diffusion import DEFAULT_3D_ENCODER_CHECKPOINT, DepthPerceptionTokenizer
 from prismatic.training.train_utils import (
     compute_actions_l1_loss,
     compute_token_accuracy,
@@ -68,21 +75,27 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
+    vla_path: str = "/home/data/huggingface/models--openvla--openvla-7b/snapshots/31f090d05236101ebfc381b61c674dd4746d4ce0/"  # Path to OpenVLA model
 
     # Dataset
-    data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
-    dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
-    run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
+    data_root_dir: Path = Path("/home/data/users/sjq/cavla/dataset")  # Directory containing 3DCAVLA depth RLDS datasets
+    dataset_name: str = "libero_spatial_cotdep"      # Name of fine-tuning dataset
+    run_root_dir: Path = Path("/home/data/users/sjq/ckpts/spatial-memory-diffusion")  # Logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
-    use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
+    use_l1_regression: bool = False                  # If True, trains continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_spatial_memory_diffusion: bool = True        # If True, trains 3D-perception-conditioned MemoryVLA DiT action expert
+    use_depth: bool = True                           # If True, loads depth maps from the RLDS dataset
+    depth_encoder_checkpoint: str = DEFAULT_3D_ENCODER_CHECKPOINT  # 3dcavla depth encoder initialization checkpoint
+    action_model_type: str = "DiT-L"                 # MemoryVLA action expert size: DiT-S, DiT-B, DiT-L
+    action_diffusion_steps: int = 100                # Diffusion steps for MemoryVLA action expert
+    repeated_diffusion_steps: int = 4                # Repeated action expert losses per batch, as in MemoryVLA
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -172,6 +185,8 @@ def get_run_id(cfg) -> str:
         )
         if cfg.use_lora:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+        if cfg.use_spatial_memory_diffusion:
+            run_id += f"+{cfg.action_model_type.lower()}+vlm-cog+3d-perattn"
         if cfg.image_aug:
             run_id += "--image_aug"
         if cfg.run_id_note is not None:
@@ -198,7 +213,28 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     return remove_ddp_in_checkpoint(state_dict)
 
 
-def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
+class SingleProcessModule(nn.Module):
+    """Expose a DDP-like `.module` attribute without DDP overhead for single-rank runs."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+def get_distributed_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def log_stage(message: str) -> None:
+    print(f"[spatial-memory-diffusion] {message}", flush=True)
+
+
+def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> nn.Module:
     """
     Wrap a module with DistributedDataParallel.
 
@@ -210,6 +246,9 @@ def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DD
     Returns:
         DistributedDataParallel: PyTorch module wrapped with DDP.
     """
+    if get_distributed_world_size() <= 1:
+        log_stage(f"Skipping DDP for single-rank module on device {device_id}")
+        return SingleProcessModule(module)
     return DDP(module, device_ids=[device_id], find_unused_parameters=find_unused, gradient_as_bucket_view=True)
 
 
@@ -266,19 +305,36 @@ def init_module(
     return wrap_ddp(module, device_id, find_unused_params)
 
 
+def gather_last_valid_vlm_token(
+    last_hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_patches: int,
+) -> torch.Tensor:
+    """Gather the final non-padding VLM token after OpenVLA's multimodal prefix insertion."""
+    token_lengths = attention_mask.to(device=last_hidden_states.device).long().sum(dim=1).clamp(min=1)
+    hidden_indices = (token_lengths - 1 + num_patches).clamp(max=last_hidden_states.shape[1] - 1)
+    gather_indices = hidden_indices.view(-1, 1, 1).expand(-1, 1, last_hidden_states.shape[-1])
+    return last_hidden_states.gather(1, gather_indices)
+
+
 def run_forward_pass(
     vla,
     action_head,
+    action_expert,
     noisy_action_projector,
     proprio_projector,
+    depth_tokenizer,
     batch,
     action_tokenizer,
     device_id,
     use_l1_regression,
     use_diffusion,
+    use_spatial_memory_diffusion,
     use_proprio,
     use_film,
     num_patches,
+    num_perception_tokens=None,
+    repeated_diffusion_steps=4,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -311,6 +367,46 @@ def run_forward_pass(
 
     # Get ground-truth action labels
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
+
+    if use_spatial_memory_diffusion:
+        if depth_tokenizer is None or action_expert is None:
+            raise ValueError("use_spatial_memory_diffusion=True requires depth_tokenizer and action_expert")
+        if "depth_maps" not in batch:
+            raise ValueError("use_spatial_memory_diffusion=True requires batch['depth_maps']; set --use_depth True")
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output: CausalLMOutputWithPast = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                labels=batch["labels"].to(device_id),
+                output_hidden_states=True,
+                proprio=batch["proprio"].to(device_id) if use_proprio and batch["proprio"] is not None else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                use_film=use_film,
+            )
+
+            # VLM final valid token is the DiT condition (`z`), matching MemoryVLA cog-token usage.
+            last_hidden_states = output.hidden_states[-1]
+            cog_tokens = gather_last_valid_vlm_token(
+                last_hidden_states=last_hidden_states,
+                attention_mask=batch["attention_mask"],
+                num_patches=num_patches,
+            ).to(torch.bfloat16)
+
+            # 3dcavla depth tokens act as DiT per-attention perception tokens.
+            depth_tokens = depth_tokenizer(
+                depth_maps=batch["depth_maps"].to(device_id),
+                target_dtype=cog_tokens.dtype,
+                target_num_tokens=num_perception_tokens,
+            )
+
+            actions_repeated = ground_truth_actions.repeat(repeated_diffusion_steps, 1, 1)
+            cog_tokens_repeated = cog_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            depth_tokens_repeated = depth_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            loss = action_expert.module.loss(actions_repeated, cog_tokens_repeated, depth_tokens_repeated)
+
+        return loss, {"loss_value": loss.item()}
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network
     if use_diffusion:
@@ -580,6 +676,8 @@ def save_training_checkpoint(
     proprio_projector,
     noisy_action_projector,
     action_head,
+    action_expert,
+    depth_tokenizer,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -639,6 +737,12 @@ def save_training_checkpoint(
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
+        if cfg.use_spatial_memory_diffusion and action_expert is not None:
+            torch.save(action_expert.state_dict(), checkpoint_dir / f"action_expert--{checkpoint_name_suffix}")
+
+        if cfg.use_spatial_memory_diffusion and depth_tokenizer is not None:
+            torch.save(depth_tokenizer.state_dict(), checkpoint_dir / f"depth_tokenizer--{checkpoint_name_suffix}")
+
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
@@ -668,13 +772,16 @@ def save_training_checkpoint(
 def run_validation(
     vla,
     action_head,
+    action_expert,
     noisy_action_projector,
     proprio_projector,
+    depth_tokenizer,
     val_dataloader,
     action_tokenizer,
     device_id,
     cfg,
     num_patches,
+    num_perception_tokens,
     log_step,
     distributed_state,
     val_time_limit,
@@ -712,16 +819,21 @@ def run_validation(
             _, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
+                action_expert=action_expert,
                 noisy_action_projector=noisy_action_projector,
                 proprio_projector=proprio_projector,
+                depth_tokenizer=depth_tokenizer,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
+                use_spatial_memory_diffusion=cfg.use_spatial_memory_diffusion,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
+                num_perception_tokens=num_perception_tokens,
+                repeated_diffusion_steps=cfg.repeated_diffusion_steps,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -769,6 +881,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
+    )
+    assert not (cfg.use_spatial_memory_diffusion and (cfg.use_l1_regression or cfg.use_diffusion)), (
+        "Spatial memory diffusion uses the MemoryVLA action expert and must not be combined with "
+        "use_l1_regression or the legacy use_diffusion action head."
+    )
+    assert not cfg.use_spatial_memory_diffusion or cfg.use_depth, (
+        "The 3D-perception DiT path requires depth maps. Please set --use_depth True."
     )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
@@ -831,19 +950,33 @@ def finetune(cfg: FinetuneConfig) -> None:
     dist.barrier()
 
     # Load processor and VLA
+    log_stage("Loading processor")
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device_id)
+    log_stage("Loading OpenVLA checkpoint")
+    if get_distributed_world_size() <= 1:
+        vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.vla_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map={"": f"cuda:{device_id}"},
+        )
+    else:
+        vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.vla_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).to(device_id)
+    log_stage("OpenVLA checkpoint loaded on target device")
 
     # Set number of images in VLA input
+    log_stage("Setting number of VLA input images")
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
     # LoRA setup
     if cfg.use_lora:
+        log_stage("Injecting LoRA adapters into OpenVLA")
         lora_config = LoraConfig(
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
@@ -853,9 +986,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+        log_stage("LoRA adapters ready")
 
     # FiLM setup
     if cfg.use_film:
+        log_stage("Initializing FiLM vision wrapper")
         count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
         # Wrap vision backbone with FiLM wrapper
         # Important: For this, must specify `vla.model.vision_backbone` instead of just `vla.vision_backbone`, since the
@@ -870,12 +1005,22 @@ def finetune(cfg: FinetuneConfig) -> None:
             state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
+        log_stage("FiLM vision wrapper ready")
 
     # Wrap VLA with DDP
+    log_stage("Wrapping OpenVLA module")
     vla = wrap_ddp(vla, device_id, find_unused=True)
+    log_stage("OpenVLA module ready")
+
+    proprio_projector = None
+    action_head = None
+    noisy_action_projector = None
+    action_expert = None
+    depth_tokenizer = None
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
+        log_stage("Initializing proprio projector")
         proprio_projector = init_module(
             ProprioProjector,
             "proprio_projector",
@@ -883,6 +1028,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             device_id,
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
         )
+        log_stage("Proprio projector ready")
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
@@ -915,13 +1061,52 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
     # Get number of vision patches
-    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    NUM_PERCEPTION_TOKENS = (
+        vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    )
+    NUM_PATCHES = NUM_PERCEPTION_TOKENS
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
+
+    if cfg.use_spatial_memory_diffusion:
+        log_stage("Initializing trainable 3D depth tokenizer")
+        depth_tokenizer = init_module(
+            DepthPerceptionTokenizer,
+            "depth_tokenizer",
+            cfg,
+            device_id,
+            {
+                "llm_dim": vla.module.llm_dim,
+                "num_depth_tokens": NUM_PERCEPTION_TOKENS,
+                "depth_encoder_checkpoint": cfg.depth_encoder_checkpoint,
+            },
+            to_bf16=True,
+            find_unused_params=True,
+        )
+        log_stage("Trainable 3D depth tokenizer ready")
+        log_stage(f"Initializing MemoryVLA action expert ({cfg.action_model_type})")
+        action_expert = init_module(
+            ActionModel,
+            "action_expert",
+            cfg,
+            device_id,
+            {
+                "token_size": vla.module.llm_dim,
+                "model_type": cfg.action_model_type,
+                "in_channels": ACTION_DIM,
+                "future_action_window_size": NUM_ACTIONS_CHUNK - 1,
+                "diffusion_steps": cfg.action_diffusion_steps,
+                "use_per_attn": True,
+                "per_token_size": vla.module.llm_dim,
+            },
+            to_bf16=True,
+            find_unused_params=True,
+        )
+        log_stage("MemoryVLA action expert ready")
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -931,7 +1116,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    if cfg.use_spatial_memory_diffusion:
+        trainable_params += [param for param in depth_tokenizer.parameters() if param.requires_grad]
+        trainable_params += [param for param in action_expert.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
+    log_stage("Creating optimizer and scheduler")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
     # Record original learning rate
@@ -945,6 +1134,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
 
     # Create Action Tokenizer
+    log_stage("Creating action tokenizer")
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
@@ -967,6 +1157,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     use_wrist_image = cfg.num_images_in_input > 1
 
     # Create training and optional validation datasets
+    log_stage("Building RLDS training dataset")
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
         processor.tokenizer,
@@ -974,6 +1165,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
+        use_depth=cfg.use_depth,
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -982,7 +1174,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        load_depth=cfg.use_depth,
     )
+    log_stage("RLDS training dataset ready")
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
             cfg.data_root_dir,
@@ -992,6 +1186,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
+            load_depth=cfg.use_depth,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1038,16 +1233,21 @@ def finetune(cfg: FinetuneConfig) -> None:
             loss, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
+                action_expert=action_expert,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
+                depth_tokenizer=depth_tokenizer if cfg.use_spatial_memory_diffusion else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
+                use_spatial_memory_diffusion=cfg.use_spatial_memory_diffusion,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
+                num_perception_tokens=NUM_PERCEPTION_TOKENS,
+                repeated_diffusion_steps=cfg.repeated_diffusion_steps,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -1109,6 +1309,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    action_expert=action_expert if cfg.use_spatial_memory_diffusion else None,
+                    depth_tokenizer=depth_tokenizer if cfg.use_spatial_memory_diffusion else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )
@@ -1118,13 +1320,16 @@ def finetune(cfg: FinetuneConfig) -> None:
                 run_validation(
                     vla=vla,
                     action_head=action_head,
+                    action_expert=action_expert,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    depth_tokenizer=depth_tokenizer if cfg.use_spatial_memory_diffusion else None,
                     val_dataloader=val_dataloader,
                     action_tokenizer=action_tokenizer,
                     device_id=device_id,
                     cfg=cfg,
                     num_patches=NUM_PATCHES,
+                    num_perception_tokens=NUM_PERCEPTION_TOKENS,
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
