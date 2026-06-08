@@ -32,6 +32,7 @@ class RLDSBatchTransform:
     predict_stop_token: bool = True
     use_wrist_image: bool = False
     use_proprio: bool = False
+    use_depth: bool = False
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
@@ -39,6 +40,7 @@ class RLDSBatchTransform:
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
+        timestep = rlds_batch["observation"].get("timestep", np.array(0))[0]
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
@@ -73,17 +75,36 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            actions=actions,
+            timestep=timestep,
+        )
+
+        if self.use_depth:
+            if "depth_primary" not in rlds_batch["observation"]:
+                raise KeyError("use_depth=True requires observation['depth_primary'] from the RLDS pipeline")
+            return_dict["depth_map"] = np.squeeze(rlds_batch["observation"]["depth_primary"][0])
 
         # Add additional inputs
         if self.use_wrist_image:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
-                if "wrist" in k:
+                if "image_wrist" in k:
                     img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
+            if not all_wrist_pixels:
+                raise KeyError("use_wrist_image=True requires an observation key containing 'image_wrist'")
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+            if self.use_depth:
+                for k in rlds_batch["observation"].keys():
+                    if "depth_wrist" in k:
+                        return_dict["depth_map_wrist"] = np.squeeze(rlds_batch["observation"][k][0])
+                        break
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
@@ -101,6 +122,7 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        load_depth: bool = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -122,7 +144,7 @@ class RLDSDataset(IterableDataset):
             self.data_root_dir,
             mixture_spec,
             load_camera_views=load_camera_views,
-            load_depth=False,
+            load_depth=load_depth,
             load_proprio=True,
             load_language=True,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
