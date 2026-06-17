@@ -106,7 +106,14 @@ class PaddedCollatorForActionPrediction:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
-        timesteps = [instance.get("timestep", idx) for idx, instance in enumerate(instances)]
+        if "episode_ids" in instances[0]:
+            episode_ids = np.concatenate([np.atleast_1d(np.asarray(instance["episode_ids"])) for instance in instances])
+        else:
+            episode_ids = None
+        if "timesteps" in instances[0]:
+            timesteps = np.concatenate([np.atleast_1d(np.asarray(instance["timesteps"])) for instance in instances])
+        else:
+            timesteps = [instance.get("timestep", idx) for idx, instance in enumerate(instances)]
 
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -163,4 +170,6 @@ class PaddedCollatorForActionPrediction:
             output["depth_maps_wrist"] = torch.stack(depth_maps_wrist)
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if episode_ids is not None:
+            output["episode_ids"] = episode_ids
         return output

@@ -28,6 +28,7 @@ class ActionModel(nn.Module):
                  noise_schedule='squaredcos_cap_v2',
                  use_per_attn=False,
                  per_token_size=None,
+                 condition_token_count=1,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -51,9 +52,10 @@ class ActionModel(nn.Module):
             future_action_window_size=future_action_window_size,
             use_per_attn=use_per_attn,
             per_token_size=per_token_size,
+            condition_token_count=condition_token_count,
             )
 
-    # Given condition z and ground truth token x, compute loss
+    # Given condition-prefix tokens z and ground truth action token x, compute loss
     def loss(self, x, z, per_token):
         # sample random noise and timestep
         noise = torch.randn_like(x) # [B, T, C]

@@ -1,1 +1,1 @@
-from .dataset import make_interleaved_dataset, make_single_dataset
+from .dataset import make_interleaved_dataset, make_interleaved_episodic_dataset, make_single_dataset

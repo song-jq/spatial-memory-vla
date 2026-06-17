@@ -195,6 +195,7 @@ class DiT(nn.Module):
         learn_sigma=False,
         use_per_attn=False,
         per_token_size=None,
+        condition_token_count=1,
     ):
         super().__init__()
 
@@ -206,6 +207,7 @@ class DiT(nn.Module):
         self.future_action_window_size = future_action_window_size
         self.use_per_attn = use_per_attn
         self.per_token_size = per_token_size
+        self.condition_token_count = condition_token_count
 
         self.x_embedder = ActionEmbedder(
             action_size=in_channels, hidden_size=hidden_size)
@@ -214,7 +216,7 @@ class DiT(nn.Module):
             in_size=token_size,
             hidden_size=hidden_size,
             dropout_prob=class_dropout_prob,
-            conditions_shape=(1, 1, token_size))
+            conditions_shape=(1, condition_token_count, token_size))
 
         if self.use_per_attn:
             assert per_token_size is not None
@@ -225,12 +227,11 @@ class DiT(nn.Module):
 
         scale = hidden_size ** -0.5
 
-        # Learnable positional embeddings
-        # +2, one for the conditional token, and one for the current action prediction
+        # Learnable positional embeddings for condition-prefix tokens and action tokens.
         self.positional_embedding = nn.Parameter(
             scale *
             torch.randn(
-                future_action_window_size + 2,
+                condition_token_count + future_action_window_size + 1,
                 hidden_size))
 
         self.blocks = nn.ModuleList([
@@ -282,23 +283,29 @@ class DiT(nn.Module):
         history: (N, H, D) tensor of action history # not used now
         x: (N, T, D) tensor of predicting action inputs
         t: (N,) tensor of diffusion timesteps
-        z: (N, 1, D) tensor of conditions
+        z: (N, Z, D) tensor of condition-prefix tokens
         """
         x = self.x_embedder(x)                              # (N, T, D)
         t = self.t_embedder(t)                              # (N, D)
-        z = self.z_embedder(z, self.training)               # (N, 1, D)
+        z = self.z_embedder(z, self.training)               # (N, Z, D)
 
         if self.use_per_attn:
             per_token = self.per_token_embedder(per_token)      # (N, P, D_per)
 
-        c = t.unsqueeze(1) + z                              # (N, 1, D)
-        x = torch.cat((c, x), dim=1)                        # (N, T+1, D)
-        x = x + self.positional_embedding                   # (N, T+1, D)
+        context_len = z.shape[1]
+        c = t.unsqueeze(1) + z                              # (N, Z, D)
+        x = torch.cat((c, x), dim=1)                        # (N, Z+T, D)
+        if x.shape[1] > self.positional_embedding.shape[0]:
+            raise ValueError(
+                f"DiT positional embedding supports {self.positional_embedding.shape[0]} tokens, "
+                f"got {x.shape[1]} ({context_len} condition + {x.shape[1] - context_len} action)."
+            )
+        x = x + self.positional_embedding[: x.shape[1]]     # (N, Z+T, D)
         for block in self.blocks:
             x = block(x, per_token)                                    # (N, T+1, D)
         x = self.final_layer(x)                             # (N, T+1, out_channels)
         # print('parameters', self.final_layer, self.final_layer.parameters())
-        return x[:, 1:, :]     # (N, T, C)
+        return x[:, context_len:, :]     # (N, T, C)
 
     def forward_with_cfg(self, x, t, z, cfg_scale, per_token):
         """

@@ -104,7 +104,7 @@ class DepthMemoryFusion(nn.Module):
         self,
         llm_dim: int,
         num_depth_tokens: int,
-        depth_encoder_checkpoint: str = DEFAULT_3D_ENCODER_CHECKPOINT,
+        depth_encoder_checkpoint: Optional[str] = DEFAULT_3D_ENCODER_CHECKPOINT,
         depth_checkpoint_pattern: str = "depth_projector1",
         dataloader_type: str = "stream",
         group_size: int = 16,
@@ -119,7 +119,8 @@ class DepthMemoryFusion(nn.Module):
         self.num_depth_tokens = num_depth_tokens
 
         self.depth_encoder = PointNetfeat(global_feat=True, feature_transform=False, use_MLP=True, output_dim=llm_dim)
-        self.load_depth_encoder(depth_encoder_checkpoint, depth_checkpoint_pattern)
+        if depth_encoder_checkpoint is not None:
+            self.load_depth_encoder(depth_encoder_checkpoint, depth_checkpoint_pattern)
         self.enable_depth_encoder_training()
 
         self.depth_projector = DepthLatentProjector(point_hidden_dim=1024, llm_dim=llm_dim)
@@ -197,7 +198,7 @@ class DepthPerceptionTokenizer(nn.Module):
         self,
         llm_dim: int,
         num_depth_tokens: int,
-        depth_encoder_checkpoint: str = DEFAULT_3D_ENCODER_CHECKPOINT,
+        depth_encoder_checkpoint: Optional[str] = DEFAULT_3D_ENCODER_CHECKPOINT,
         depth_checkpoint_pattern: str = "depth_projector1",
     ) -> None:
         super().__init__()
@@ -205,7 +206,8 @@ class DepthPerceptionTokenizer(nn.Module):
         self.num_depth_tokens = num_depth_tokens
 
         self.depth_encoder = PointNetfeat(global_feat=True, feature_transform=False, use_MLP=True, output_dim=llm_dim)
-        self.load_depth_encoder(depth_encoder_checkpoint, depth_checkpoint_pattern)
+        if depth_encoder_checkpoint is not None:
+            self.load_depth_encoder(depth_encoder_checkpoint, depth_checkpoint_pattern)
         self.enable_depth_encoder_training()
 
         self.depth_projector = DepthLatentProjector(point_hidden_dim=1024, llm_dim=llm_dim)

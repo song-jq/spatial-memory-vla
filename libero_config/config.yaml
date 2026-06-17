@@ -1,0 +1,5 @@
+assets: /home/data/users/sjq/LIBERO/libero/libero/assets
+bddl_files: /home/data/users/sjq/LIBERO/libero/libero/bddl_files
+benchmark_root: /home/data/users/sjq/LIBERO/libero/libero
+datasets: /home/data/users/sjq/LIBERO/libero/datasets
+init_states: /home/data/users/sjq/LIBERO/libero/libero/init_files

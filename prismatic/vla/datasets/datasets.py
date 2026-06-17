@@ -20,7 +20,7 @@ from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
-from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
+from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_interleaved_episodic_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 
 @dataclass
@@ -226,6 +226,46 @@ class EpisodicRLDSDataset(RLDSDataset):
                 for i in range(rlds_batch["action"].shape[0])
             ]
             yield out
+
+
+class StreamRLDSDataset(RLDSDataset):
+    """Yields ordered frames from whole episodes and attaches true episode ids for memory-bank training."""
+
+    def make_dataset(self, rlds_config):
+        return make_interleaved_episodic_dataset(**rlds_config, use_optim_group_sample=False)
+
+    def __iter__(self) -> Dict[str, Any]:
+        episode_id = -1
+        for rlds_batch in self.dataset.as_numpy_iterator():
+            episode_id += 1
+            for frame_idx in range(rlds_batch["action"].shape[0]):
+                frame = self.batch_transform(tree_map(lambda x: x[frame_idx], rlds_batch))
+                frame["episode_ids"] = np.array([episode_id])
+                yield frame
+
+
+class GroupRLDSDataset(RLDSDataset):
+    """Yields a sorted group of frames per episode and attaches true episode ids for memory-bank training."""
+
+    def __init__(self, *args, group_size: int = 16, **kwargs):
+        self.group_size = group_size
+        super().__init__(*args, **kwargs)
+
+    def make_dataset(self, rlds_config):
+        return make_interleaved_episodic_dataset(
+            **rlds_config,
+            group_size=self.group_size,
+            use_optim_group_sample=True,
+        )
+
+    def __iter__(self) -> Dict[str, Any]:
+        episode_id = -1
+        for rlds_batch in self.dataset.as_numpy_iterator():
+            episode_id += 1
+            for frame_idx in range(rlds_batch["action"].shape[0]):
+                frame = self.batch_transform(tree_map(lambda x: x[frame_idx], rlds_batch))
+                frame["episode_ids"] = np.array([episode_id])
+                yield frame
 
 
 class DummyDataset(Dataset):

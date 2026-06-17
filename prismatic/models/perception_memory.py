@@ -50,3 +50,23 @@ class PerceptionMemoryFusion(nn.Module):
         if perception_tokens.ndim != 3:
             raise ValueError(f"Expected perception tokens shaped [B, N, D], got {tuple(perception_tokens.shape)}")
         return self.memory_bank.process_batch(perception_tokens, episode_ids=episode_ids, timesteps=timesteps)
+
+
+class PerceptionPrefixCompressor(nn.Module):
+    """Compress memory-conditioned perception tokens before they enter DiT self-attention."""
+
+    def __init__(self, llm_dim: int, output_tokens: int = 16) -> None:
+        super().__init__()
+        if output_tokens <= 0:
+            raise ValueError(f"output_tokens must be positive, got {output_tokens}")
+        self.output_tokens = output_tokens
+        self.norm = nn.LayerNorm(llm_dim)
+        self.proj = nn.Linear(llm_dim, llm_dim)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(f"Expected tokens shaped [B, N, D], got {tuple(tokens.shape)}")
+        if tokens.shape[1] != self.output_tokens:
+            tokens = tokens.transpose(1, 2)
+            tokens = nn.functional.adaptive_avg_pool1d(tokens, self.output_tokens).transpose(1, 2)
+        return self.proj(self.norm(tokens))
