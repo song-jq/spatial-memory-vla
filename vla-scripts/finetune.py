@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import draccus
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -50,7 +51,7 @@ from prismatic.models.projectors import (
     NoisyActionProjector,
     ProprioProjector,
 )
-from prismatic.models.spatial_memory_diffusion import DEFAULT_3D_ENCODER_CHECKPOINT, DepthPerceptionTokenizer
+from prismatic.models.spatial_memory_diffusion import DEFAULT_3D_ENCODER_CHECKPOINT, DepthMemoryFusion
 from prismatic.training.train_utils import (
     compute_actions_l1_loss,
     compute_token_accuracy,
@@ -65,7 +66,7 @@ from prismatic.vla.constants import (
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
 )
-from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+from prismatic.vla.datasets import GroupRLDSDataset, RLDSBatchTransform, RLDSDataset, StreamRLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 # Sane Defaults
@@ -80,7 +81,7 @@ class FinetuneConfig:
     # Dataset
     data_root_dir: Path = Path("/home/data/users/sjq/cavla/dataset")  # Directory containing 3DCAVLA depth RLDS datasets
     dataset_name: str = "libero_spatial_cotdep"      # Name of fine-tuning dataset
-    run_root_dir: Path = Path("/home/data/users/sjq/ckpts/spatial-memory-diffusion")  # Logs & checkpoints
+    run_root_dir: Path = Path("/home/data/users/sjq/ckpts/spatial-memory-vla")  # Logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
@@ -96,6 +97,10 @@ class FinetuneConfig:
     action_model_type: str = "DiT-L"                 # MemoryVLA action expert size: DiT-S, DiT-B, DiT-L
     action_diffusion_steps: int = 100                # Diffusion steps for MemoryVLA action expert
     repeated_diffusion_steps: int = 4                # Repeated action expert losses per batch, as in MemoryVLA
+    mem_length: int = 16                             # Memory bank history length
+    retrieval_layers: int = 2                        # Memory retrieval cross-attention depth
+    memory_dataloader_type: str = "stream"           # Memory bank mode: stream or group
+    memory_group_size: int = 16                      # Group size when memory_dataloader_type=group
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -112,6 +117,7 @@ class FinetuneConfig:
                                                      #   (If False, saves all checkpoints)
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume_checkpoint_dir: Optional[Path] = None     # (When `resume==True`) Directory containing saved LoRA/components
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -173,7 +179,7 @@ def get_run_id(cfg) -> str:
         run_id = cfg.run_id_override
     elif cfg.resume:
         # Override run ID with the previous resumed run's ID
-        run_id = cfg.vla_path.split("/")[-1]
+        run_id = Path(get_resume_checkpoint_dir(cfg)).name
         # Remove the "--XXX_chkpt" suffix from the run ID if it exists
         if "chkpt" in run_id.split("--")[-1]:
             run_id = "--".join(run_id.split("--")[:-1])
@@ -186,12 +192,18 @@ def get_run_id(cfg) -> str:
         if cfg.use_lora:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
         if cfg.use_spatial_memory_diffusion:
-            run_id += f"+{cfg.action_model_type.lower()}+vlm-cog+3d-perattn"
+            run_id += f"+{cfg.action_model_type.lower()}+gated-3d-memory"
         if cfg.image_aug:
             run_id += "--image_aug"
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
+
+
+def get_resume_checkpoint_dir(cfg) -> str:
+    if cfg.resume_checkpoint_dir is not None:
+        return str(cfg.resume_checkpoint_dir).rstrip("/")
+    return cfg.vla_path.rstrip("/")
 
 
 def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
@@ -231,7 +243,7 @@ def get_distributed_world_size() -> int:
 
 
 def log_stage(message: str) -> None:
-    print(f"[spatial-memory-diffusion] {message}", flush=True)
+    print(f"[spatial-memory-vla] {message}", flush=True)
 
 
 def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> nn.Module:
@@ -295,7 +307,7 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        state_dict = load_checkpoint(module_name, get_resume_checkpoint_dir(cfg), cfg.resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -323,7 +335,7 @@ def run_forward_pass(
     action_expert,
     noisy_action_projector,
     proprio_projector,
-    depth_tokenizer,
+    depth_memory_fusion,
     batch,
     action_tokenizer,
     device_id,
@@ -369,8 +381,8 @@ def run_forward_pass(
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
 
     if use_spatial_memory_diffusion:
-        if depth_tokenizer is None or action_expert is None:
-            raise ValueError("use_spatial_memory_diffusion=True requires depth_tokenizer and action_expert")
+        if depth_memory_fusion is None or action_expert is None:
+            raise ValueError("use_spatial_memory_diffusion=True requires depth_memory_fusion and action_expert")
         if "depth_maps" not in batch:
             raise ValueError("use_spatial_memory_diffusion=True requires batch['depth_maps']; set --use_depth True")
 
@@ -394,17 +406,37 @@ def run_forward_pass(
                 num_patches=num_patches,
             ).to(torch.bfloat16)
 
-            # 3dcavla depth tokens act as DiT per-attention perception tokens.
-            depth_tokens = depth_tokenizer(
+            perception_token_count = num_perception_tokens if num_perception_tokens is not None else num_patches
+            perception_tokens = last_hidden_states[:, 1 : 1 + perception_token_count].to(torch.bfloat16)
+
+            if "episode_ids" not in batch or batch["episode_ids"] is None:
+                raise ValueError(
+                    "Spatial memory diffusion training requires true episode_ids. "
+                    "Use StreamRLDSDataset or GroupRLDSDataset instead of frame-shuffled RLDSDataset."
+                )
+            episode_ids = np.asarray(batch["episode_ids"])
+
+            if "timesteps" in batch and batch["timesteps"] is not None:
+                batch_timesteps = batch["timesteps"]
+                if isinstance(batch_timesteps, torch.Tensor):
+                    timesteps = batch_timesteps.detach().cpu().numpy()
+                else:
+                    timesteps = np.asarray(batch_timesteps)
+            else:
+                timesteps = np.arange(perception_tokens.shape[0])
+
+            # Gate VLM perception tokens with 3dcavla depth tokens, query/write memory, then feed DiT attention.
+            memory_tokens = depth_memory_fusion(
+                perception_tokens=perception_tokens,
                 depth_maps=batch["depth_maps"].to(device_id),
-                target_dtype=cog_tokens.dtype,
-                target_num_tokens=num_perception_tokens,
+                episode_ids=episode_ids,
+                timesteps=timesteps,
             )
 
             actions_repeated = ground_truth_actions.repeat(repeated_diffusion_steps, 1, 1)
             cog_tokens_repeated = cog_tokens.repeat(repeated_diffusion_steps, 1, 1)
-            depth_tokens_repeated = depth_tokens.repeat(repeated_diffusion_steps, 1, 1)
-            loss = action_expert.module.loss(actions_repeated, cog_tokens_repeated, depth_tokens_repeated)
+            memory_tokens_repeated = memory_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            loss = action_expert.module.loss(actions_repeated, cog_tokens_repeated, memory_tokens_repeated)
 
         return loss, {"loss_value": loss.item()}
 
@@ -677,7 +709,7 @@ def save_training_checkpoint(
     noisy_action_projector,
     action_head,
     action_expert,
-    depth_tokenizer,
+    depth_memory_fusion,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -740,8 +772,11 @@ def save_training_checkpoint(
         if cfg.use_spatial_memory_diffusion and action_expert is not None:
             torch.save(action_expert.state_dict(), checkpoint_dir / f"action_expert--{checkpoint_name_suffix}")
 
-        if cfg.use_spatial_memory_diffusion and depth_tokenizer is not None:
-            torch.save(depth_tokenizer.state_dict(), checkpoint_dir / f"depth_tokenizer--{checkpoint_name_suffix}")
+        if cfg.use_spatial_memory_diffusion and depth_memory_fusion is not None:
+            torch.save(
+                depth_memory_fusion.state_dict(),
+                checkpoint_dir / f"depth_memory_fusion--{checkpoint_name_suffix}",
+            )
 
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
@@ -775,7 +810,7 @@ def run_validation(
     action_expert,
     noisy_action_projector,
     proprio_projector,
-    depth_tokenizer,
+    depth_memory_fusion,
     val_dataloader,
     action_tokenizer,
     device_id,
@@ -822,7 +857,7 @@ def run_validation(
                 action_expert=action_expert,
                 noisy_action_projector=noisy_action_projector,
                 proprio_projector=proprio_projector,
-                depth_tokenizer=depth_tokenizer,
+                depth_memory_fusion=depth_memory_fusion,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -893,6 +928,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
+    if cfg.resume:
+        if cfg.resume_step is None:
+            raise ValueError("Resume training requires --resume_step.")
+        if cfg.resume_checkpoint_dir is None:
+            raise ValueError("Resume training requires --resume_checkpoint_dir separate from --vla_path.")
+        resume_checkpoint_dir = get_resume_checkpoint_dir(cfg)
+        print(f"Resuming trainable components from `{resume_checkpoint_dir}` at step {cfg.resume_step}")
 
     # Get experiment run ID
     run_id = get_run_id(cfg)
@@ -976,15 +1018,22 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # LoRA setup
     if cfg.use_lora:
-        log_stage("Injecting LoRA adapters into OpenVLA")
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume:
+            adapter_dir = Path(get_resume_checkpoint_dir(cfg)) / "lora_adapter"
+            if not adapter_dir.exists():
+                raise FileNotFoundError(f"Missing LoRA adapter for resume: {adapter_dir}")
+            log_stage(f"Loading LoRA adapter from {adapter_dir}")
+            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
+        else:
+            log_stage("Injecting LoRA adapters into OpenVLA")
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules="all-linear",
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
         log_stage("LoRA adapters ready")
 
@@ -1002,7 +1051,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
         if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+            state_dict = load_checkpoint("vision_backbone", get_resume_checkpoint_dir(cfg), cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
         log_stage("FiLM vision wrapper ready")
@@ -1016,7 +1065,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     action_head = None
     noisy_action_projector = None
     action_expert = None
-    depth_tokenizer = None
+    depth_memory_fusion = None
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -1073,21 +1122,26 @@ def finetune(cfg: FinetuneConfig) -> None:
         NUM_PATCHES += 1
 
     if cfg.use_spatial_memory_diffusion:
-        log_stage("Initializing trainable 3D depth tokenizer")
-        depth_tokenizer = init_module(
-            DepthPerceptionTokenizer,
-            "depth_tokenizer",
+        log_stage("Initializing gated 3D memory fusion module")
+        depth_memory_fusion = init_module(
+            DepthMemoryFusion,
+            "depth_memory_fusion",
             cfg,
             device_id,
             {
                 "llm_dim": vla.module.llm_dim,
                 "num_depth_tokens": NUM_PERCEPTION_TOKENS,
-                "depth_encoder_checkpoint": cfg.depth_encoder_checkpoint,
+                "depth_encoder_checkpoint": None if cfg.resume else cfg.depth_encoder_checkpoint,
+                "dataloader_type": cfg.memory_dataloader_type,
+                "group_size": cfg.memory_group_size,
+                "mem_length": cfg.mem_length,
+                "retrieval_layers": cfg.retrieval_layers,
+                "use_timestep_pe": True,
             },
             to_bf16=True,
             find_unused_params=True,
         )
-        log_stage("Trainable 3D depth tokenizer ready")
+        log_stage("Gated 3D memory fusion module ready")
         log_stage(f"Initializing MemoryVLA action expert ({cfg.action_model_type})")
         action_expert = init_module(
             ActionModel,
@@ -1117,7 +1171,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     if cfg.use_spatial_memory_diffusion:
-        trainable_params += [param for param in depth_tokenizer.parameters() if param.requires_grad]
+        trainable_params += [param for param in depth_memory_fusion.parameters() if param.requires_grad]
         trainable_params += [param for param in action_expert.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     log_stage("Creating optimizer and scheduler")
@@ -1167,7 +1221,20 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_proprio=cfg.use_proprio,
         use_depth=cfg.use_depth,
     )
-    train_dataset = RLDSDataset(
+
+    dataset_cls = RLDSDataset
+    dataset_extra_kwargs = {}
+    if cfg.use_spatial_memory_diffusion:
+        if cfg.memory_dataloader_type == "stream":
+            dataset_cls = StreamRLDSDataset
+        elif cfg.memory_dataloader_type == "group":
+            dataset_cls = GroupRLDSDataset
+            dataset_extra_kwargs["group_size"] = cfg.memory_group_size
+        else:
+            raise ValueError(f"Unsupported memory_dataloader_type: {cfg.memory_dataloader_type}")
+        log_stage(f"Using episodic {cfg.memory_dataloader_type} RLDS dataset for memory-bank training")
+
+    train_dataset = dataset_cls(
         cfg.data_root_dir,
         cfg.dataset_name,
         batch_transform,
@@ -1175,10 +1242,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         load_depth=cfg.use_depth,
+        **dataset_extra_kwargs,
     )
     log_stage("RLDS training dataset ready")
     if cfg.use_val_set:
-        val_dataset = RLDSDataset(
+        val_dataset = dataset_cls(
             cfg.data_root_dir,
             cfg.dataset_name,
             batch_transform,
@@ -1187,6 +1255,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             image_aug=cfg.image_aug,
             train=False,
             load_depth=cfg.use_depth,
+            **dataset_extra_kwargs,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1236,7 +1305,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 action_expert=action_expert,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
-                depth_tokenizer=depth_tokenizer if cfg.use_spatial_memory_diffusion else None,
+                depth_memory_fusion=depth_memory_fusion if cfg.use_spatial_memory_diffusion else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -1310,7 +1379,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                     action_expert=action_expert if cfg.use_spatial_memory_diffusion else None,
-                    depth_tokenizer=depth_tokenizer if cfg.use_spatial_memory_diffusion else None,
+                    depth_memory_fusion=depth_memory_fusion if cfg.use_spatial_memory_diffusion else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )
@@ -1323,7 +1392,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     action_expert=action_expert,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    depth_tokenizer=depth_tokenizer if cfg.use_spatial_memory_diffusion else None,
+                    depth_memory_fusion=depth_memory_fusion if cfg.use_spatial_memory_diffusion else None,
                     val_dataloader=val_dataloader,
                     action_tokenizer=action_tokenizer,
                     device_id=device_id,

@@ -15,11 +15,29 @@ from experiments.robot.robot_utils import (
 )
 
 
+def _get_render_gpu_device_id():
+    """Return the EGL render device requested by the launch environment."""
+    device_id = os.environ.get("MUJOCO_EGL_DEVICE_ID")
+    if device_id is None:
+        device_id = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",", 1)[0]
+    if device_id and device_id.lstrip("-").isdigit():
+        return int(device_id)
+    return -1
+
+
 def get_libero_env(task, model_family, resolution=256):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+        "has_renderer": False,
+        "has_offscreen_renderer": True,
+    }
+    if os.environ.get("MUJOCO_GL", "").lower() == "egl":
+        env_args["render_gpu_device_id"] = _get_render_gpu_device_id()
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description

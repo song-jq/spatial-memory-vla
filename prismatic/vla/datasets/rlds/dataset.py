@@ -583,3 +583,124 @@ def make_interleaved_dataset(
     dataset.sample_weights = sample_weights
 
     return dataset, dataset_len, all_dataset_statistics
+
+
+def make_interleaved_episodic_dataset(
+    dataset_kwargs_list: List[Dict],
+    sample_weights: Optional[List[float]] = None,
+    *,
+    train: bool,
+    shuffle_buffer_size: int,
+    traj_transform_kwargs: Optional[Dict] = None,
+    frame_transform_kwargs: Optional[Dict] = None,
+    batch_size: Optional[int] = None,
+    balance_weights: bool = False,
+    traj_transform_threads: Optional[int] = None,
+    traj_read_threads: Optional[int] = None,
+    group_size: int = 16,
+    use_optim_group_sample: bool = False,
+) -> dl.DLataset:
+    """
+    Creates an interleaved dataset that keeps each sampled item as a trajectory.
+
+    The PyTorch wrapper can then emit ordered frames from one trajectory and attach
+    a stable episode id, which is required for MemoryVLA-style memory banks.
+    """
+    if not sample_weights:
+        sample_weights = [1.0] * len(dataset_kwargs_list)
+
+    if len(sample_weights) != len(dataset_kwargs_list):
+        raise ValueError(f"sample_weights must be None or have length {len(dataset_kwargs_list)}.")
+
+    if (traj_transform_kwargs is None) or (frame_transform_kwargs is None):
+        raise ValueError("Missing `traj_transform_kwargs` and `frame_transform_kwargs`!")
+
+    dataset_sizes, all_dataset_statistics = [], {}
+    for dataset_kwargs in dataset_kwargs_list:
+        data_kwargs = copy.deepcopy(dataset_kwargs)
+        if "dataset_frame_transform_kwargs" in data_kwargs:
+            data_kwargs.pop("dataset_frame_transform_kwargs")
+        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
+        dataset_sizes.append(dataset_statistics["num_transitions"])
+        all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
+
+    primary_dataset_indices = np.array([idx for idx in range(len(sample_weights)) if sample_weights[idx] == 1.0])
+
+    if balance_weights:
+        sample_weights = np.array(sample_weights) * np.array(dataset_sizes)
+    sample_weights = np.array(sample_weights) / np.sum(sample_weights)
+    pprint_data_mixture(dataset_kwargs_list, sample_weights)
+
+    dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices].max())
+
+    threads_per_dataset = allocate_threads(traj_transform_threads, sample_weights)
+    reads_per_dataset = allocate_threads(traj_read_threads, sample_weights)
+
+    overwatch.info("Threads per Dataset: %s", threads_per_dataset)
+    overwatch.info("Reads per Dataset: %s", reads_per_dataset)
+
+    overwatch.info("Constructing episodic datasets...")
+    datasets = []
+    for dataset_kwargs, threads, reads in zip(
+        dataset_kwargs_list,
+        threads_per_dataset,
+        reads_per_dataset,
+    ):
+        dataset_frame_transform_kwargs = (
+            dataset_kwargs.pop("dataset_frame_transform_kwargs")
+            if "dataset_frame_transform_kwargs" in dataset_kwargs
+            else {}
+        )
+        dataset, _ = make_dataset_from_rlds(
+            **dataset_kwargs,
+            train=train,
+            num_parallel_calls=threads,
+            num_parallel_reads=reads,
+            dataset_statistics=all_dataset_statistics[dataset_kwargs["name"]],
+        )
+        dataset = apply_trajectory_transforms(
+            dataset.repeat(),
+            **traj_transform_kwargs,
+            num_parallel_calls=threads,
+            train=train,
+        )
+
+        if use_optim_group_sample:
+
+            def group_sample(traj):
+                num_frames = tf.shape(traj["action"])[0]
+
+                def pad_case():
+                    return tf.concat(
+                        [tf.range(num_frames), tf.fill([group_size - num_frames], num_frames - 1)],
+                        axis=0,
+                    )
+
+                def sample_case():
+                    return tf.sort(tf.random.shuffle(tf.range(num_frames))[:group_size])
+
+                indices = tf.cond(num_frames < group_size, pad_case, sample_case)
+                return tf.nest.map_structure(lambda tensor: tf.gather(tensor, indices, axis=0), traj)
+
+            dataset = dataset.map(group_sample, num_parallel_calls=threads)
+
+        dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
+        datasets.append(dataset)
+
+    dataset: dl.DLataset = dl.DLataset.sample_from_datasets(datasets, sample_weights)
+
+    if not train:
+        dataset = dataset.take(shuffle_buffer_size).cache()
+
+    dataset = dataset.shuffle(shuffle_buffer_size)
+
+    overwatch.info("Applying frame transforms on episodic dataset...")
+    dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
+
+    if batch_size is not None:
+        dataset = dataset.batch(batch_size)
+
+    dataset = dataset.with_ram_budget(1)
+    dataset.sample_weights = sample_weights
+
+    return dataset, dataset_len, all_dataset_statistics

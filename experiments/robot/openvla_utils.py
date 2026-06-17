@@ -15,6 +15,7 @@ import requests
 import tensorflow as tf
 import torch
 from huggingface_hub import HfApi, hf_hub_download
+from peft import PeftModel
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
@@ -38,6 +39,7 @@ DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 OPENVLA_IMAGE_SIZE = 224  # Standard image size expected by OpenVLA
+DEFAULT_BASE_VLA_PATH = "/home/data/huggingface/models--openvla--openvla-7b/snapshots/31f090d05236101ebfc381b61c674dd4746d4ce0"
 
 # Configure NumPy print settings
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
@@ -250,6 +252,20 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     return new_state_dict
 
 
+def checkpoint_has_lora_adapter(checkpoint_path: str) -> bool:
+    """Return True for component-style checkpoints saved with an unmerged LoRA adapter."""
+    adapter_path = os.path.join(checkpoint_path, "lora_adapter")
+    return os.path.isdir(adapter_path) and os.path.isfile(os.path.join(adapter_path, "adapter_config.json"))
+
+
+def resolve_vla_load_path(checkpoint_path: str) -> Tuple[str, Optional[str]]:
+    """Resolve the HF model path and optional LoRA adapter path for evaluation loading."""
+    if os.path.isdir(checkpoint_path) and not os.path.isfile(os.path.join(checkpoint_path, "config.json")):
+        if checkpoint_has_lora_adapter(checkpoint_path):
+            return DEFAULT_BASE_VLA_PATH, os.path.join(checkpoint_path, "lora_adapter")
+    return checkpoint_path, None
+
+
 def get_vla(cfg: Any) -> torch.nn.Module:
     """
     Load and initialize the VLA model from checkpoint.
@@ -261,13 +277,14 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         torch.nn.Module: The initialized VLA model
     """
     print("Instantiating pretrained VLA policy...")
+    vla_load_path, lora_adapter_path = resolve_vla_load_path(str(cfg.pretrained_checkpoint))
 
     # If loading a locally stored pretrained checkpoint, check whether config or model files
     # need to be synced so that any changes the user makes to the VLA modeling code will
     # actually go into effect
     # If loading a pretrained checkpoint from Hugging Face Hub, we just assume that the policy
     # will be used as is, with its original modeling logic
-    if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
+    if not model_is_on_hf_hub(vla_load_path):
         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
@@ -275,12 +292,12 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
         # Update config.json and sync model files
-        update_auto_map(cfg.pretrained_checkpoint)
-        check_model_logic_mismatch(cfg.pretrained_checkpoint)
+        update_auto_map(vla_load_path)
+        check_model_logic_mismatch(vla_load_path)
 
     # Load the model
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
+        vla_load_path,
         # attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
@@ -288,6 +305,10 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    if lora_adapter_path is not None:
+        print(f"Loading LoRA adapter from component checkpoint: {lora_adapter_path}")
+        vla = PeftModel.from_pretrained(vla, lora_adapter_path)
+        vla = vla.merge_and_unload()
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:

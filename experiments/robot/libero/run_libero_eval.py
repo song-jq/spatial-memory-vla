@@ -17,6 +17,30 @@ from typing import Optional, Union
 import draccus
 import numpy as np
 import tqdm
+
+
+def _configure_headless_rendering() -> None:
+    """Configure LIBERO/MuJoCo before robosuite is imported."""
+    os.environ.setdefault("LIBERO_CONFIG_PATH", str(Path(__file__).resolve().parents[3] / "libero_config"))
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    if os.environ.get("MUJOCO_GL", "").lower() == "egl":
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+        if not os.environ.get("MUJOCO_EGL_DEVICE_ID"):
+            visible_device = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",", 1)[0].strip()
+            os.environ["MUJOCO_EGL_DEVICE_ID"] = visible_device if visible_device.isdigit() else "0"
+    if os.environ.get("LIBERO_KEEP_DISPLAY", "").lower() not in {"1", "true", "yes"}:
+        os.environ.pop("DISPLAY", None)
+
+
+_configure_headless_rendering()
+
+for extra_python_path in (
+    Path("/home/data/users/sjq/LIBERO"),
+    Path("/home/data/users/sjq/anaconda3/envs/cavla3d/lib/python3.10/site-packages"),
+):
+    if extra_python_path.is_dir():
+        sys.path.append(str(extra_python_path))
+
 from libero.libero import benchmark
 
 import wandb
@@ -178,8 +202,10 @@ def initialize_model(cfg: GenerateConfig):
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
     """Check that the model contains the action un-normalization key."""
-    # Initialize unnorm_key
-    unnorm_key = cfg.task_suite_name
+    # Initialize unnorm_key. Keep an explicit override for checkpoints trained
+    # on a LIBERO data variant, e.g. libero_spatial_cotdep evaluated in the
+    # standard libero_spatial simulator suite.
+    unnorm_key = str(cfg.unnorm_key) if cfg.unnorm_key else cfg.task_suite_name
 
     # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
     # with the suffix "_no_noops" in the dataset name)
