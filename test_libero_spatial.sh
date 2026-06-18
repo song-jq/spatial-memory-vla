@@ -4,7 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-DEFAULT_CKPT_PATH="/home/data/users/sjq/ckpts/spatial-memory-vla/31f090d05236101ebfc381b61c674dd4746d4ce0+libero_spatial_cotdep+b1+lr-5e-05+lora-r16+dropout-0.0+dit-l+gated-3d-memory--image_aug--gated_3d_memory_dit--50000_chkpt"
+CKPT_PREFIX="/home/data/users/sjq/ckpts/spatial-memory-vla/"
+# DEFAULT_CKPT_PATH="/home/data/users/sjq/ckpts/spatial-memory-vla/31f090d05236101ebfc381b61c674dd4746d4ce0+libero_spatial_cotdep+b1+lr-5e-05+lora-r16+dropout-0.0+dit-l+gated-3d-memory--image_aug--gated_3d_memory_dit--50000_chkpt"
+CKPT_NAME="31f090d05236101ebfc381b61c674dd4746d4ce0+libero_spatial_cotdep+b1+lr-5e-05+lora-r16+dropout-0.0+dit-l+gated-3d-memory--image_aug--add_3d_memory_dit--75000_chkpt"
+DEFAULT_CKPT_PATH="${CKPT_PREFIX}${CKPT_NAME}"
 
 CKPT_PATH="${CKPT_PATH:-${DEFAULT_CKPT_PATH}}"
 GPU_ID="${GPU_ID:-0}"
