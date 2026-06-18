@@ -101,6 +101,7 @@ class FinetuneConfig:
     retrieval_layers: int = 2                        # Memory retrieval cross-attention depth
     memory_dataloader_type: str = "stream"           # Memory bank mode: stream or group
     memory_group_size: int = 16                      # Group size when memory_dataloader_type=group
+    depth_perception_fusion_type: str = "gate"       # Fuse perception/depth tokens with "gate" or "add"
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -425,7 +426,7 @@ def run_forward_pass(
             else:
                 timesteps = np.arange(perception_tokens.shape[0])
 
-            # Gate VLM perception tokens with 3dcavla depth tokens, query/write memory, then feed DiT attention.
+            # Fuse VLM perception tokens with 3dcavla depth tokens, query/write memory, then feed DiT attention.
             memory_tokens = depth_memory_fusion(
                 perception_tokens=perception_tokens,
                 depth_maps=batch["depth_maps"].to(device_id),
@@ -1122,7 +1123,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         NUM_PATCHES += 1
 
     if cfg.use_spatial_memory_diffusion:
-        log_stage("Initializing gated 3D memory fusion module")
+        log_stage(f"Initializing {cfg.depth_perception_fusion_type} 3D memory fusion module")
         depth_memory_fusion = init_module(
             DepthMemoryFusion,
             "depth_memory_fusion",
@@ -1137,11 +1138,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "mem_length": cfg.mem_length,
                 "retrieval_layers": cfg.retrieval_layers,
                 "use_timestep_pe": True,
+                "depth_perception_fusion_type": cfg.depth_perception_fusion_type,
             },
             to_bf16=True,
             find_unused_params=True,
         )
-        log_stage("Gated 3D memory fusion module ready")
+        log_stage("3D memory fusion module ready")
         log_stage(f"Initializing MemoryVLA action expert ({cfg.action_model_type})")
         action_expert = init_module(
             ActionModel,

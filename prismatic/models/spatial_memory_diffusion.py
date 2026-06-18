@@ -94,7 +94,7 @@ class DepthLatentProjector(nn.Module):
 
 class DepthMemoryFusion(nn.Module):
     """
-    Trainable 3dcavla depth encoder + projector + gated perception/depth fusion + MemoryVLA bank.
+    Trainable 3dcavla depth encoder + projector + perception/depth fusion + MemoryVLA bank.
 
     Input perception tokens should be VLM last-layer perception tokens shaped [B, N, D].
     Output memory-conditioned tokens keep the same shape and can be used as DiT per-attention tokens.
@@ -113,10 +113,14 @@ class DepthMemoryFusion(nn.Module):
         use_timestep_pe: bool = True,
         consolidate_type: str = "tome",
         update_fused: bool = False,
+        depth_perception_fusion_type: str = "gate",
     ) -> None:
         super().__init__()
+        if depth_perception_fusion_type not in ("gate", "add"):
+            raise ValueError(f"Unsupported depth_perception_fusion_type: {depth_perception_fusion_type}")
         self.llm_dim = llm_dim
         self.num_depth_tokens = num_depth_tokens
+        self.depth_perception_fusion_type = depth_perception_fusion_type
 
         self.depth_encoder = PointNetfeat(global_feat=True, feature_transform=False, use_MLP=True, output_dim=llm_dim)
         if depth_encoder_checkpoint is not None:
@@ -124,7 +128,7 @@ class DepthMemoryFusion(nn.Module):
         self.enable_depth_encoder_training()
 
         self.depth_projector = DepthLatentProjector(point_hidden_dim=1024, llm_dim=llm_dim)
-        self.depth_perception_gate = GateFusion(llm_dim)
+        self.depth_perception_gate = GateFusion(llm_dim) if self.depth_perception_fusion_type == "gate" else None
         self.memory_bank = CogMemBank(
             dataloader_type=dataloader_type,
             group_size=group_size,
@@ -181,7 +185,10 @@ class DepthMemoryFusion(nn.Module):
             depth_tokens = depth_tokens.transpose(1, 2)
             depth_tokens = F.adaptive_avg_pool1d(depth_tokens, perception_tokens.shape[1]).transpose(1, 2)
 
-        fused_tokens = self.depth_perception_gate(perception_tokens, depth_tokens)
+        if self.depth_perception_fusion_type == "add":
+            fused_tokens = 0.5 * (perception_tokens + depth_tokens)
+        else:
+            fused_tokens = self.depth_perception_gate(perception_tokens, depth_tokens)
         return self.memory_bank.process_batch(fused_tokens, episode_ids=episode_ids, timesteps=timesteps)
 
 
