@@ -19,7 +19,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import draccus
 import timm
@@ -35,6 +35,27 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
 
+def resolve_local_prismatic_checkpoint(run_dir: Path) -> Path:
+    """Find the Prismatic checkpoint in a local OpenVLA run directory."""
+    checkpoint_dir = run_dir / "checkpoints"
+    latest_checkpoint = checkpoint_dir / "latest-checkpoint.pt"
+    if latest_checkpoint.exists():
+        return latest_checkpoint
+
+    checkpoint_candidates = sorted(checkpoint_dir.glob("*.pt"))
+    if len(checkpoint_candidates) == 1:
+        return checkpoint_candidates[0]
+
+    if checkpoint_candidates:
+        formatted = "\n  ".join(str(path) for path in checkpoint_candidates)
+        raise FileNotFoundError(
+            f"Missing `{latest_checkpoint}` and found multiple checkpoint candidates. "
+            f"Please keep only one checkpoint or create a latest-checkpoint.pt symlink:\n  {formatted}"
+        )
+
+    raise FileNotFoundError(f"Missing checkpoint under `{checkpoint_dir}`")
+
+
 @dataclass
 class HFConvertConfig:
     # fmt: off
@@ -46,12 +67,19 @@ class HFConvertConfig:
     )
     output_hf_model_hub_path: str = "openvla/openvla-7b"                # (Optional) Path to HF Hub Path to push
                                                                         # model to
+    tokenizer_path_or_id: Optional[Union[str, Path]] = Path(            # Prefer local tokenizer to avoid Llama-2 gated repo access
+        "/home/data/huggingface/models--openvla--openvla-7b/snapshots/31f090d05236101ebfc381b61c674dd4746d4ce0"
+    )
+    image_processor_path_or_id: Optional[Union[str, Path]] = Path(      # Prefer local processor to avoid TIMM downloads/init
+        "/home/data/huggingface/models--openvla--openvla-7b/snapshots/31f090d05236101ebfc381b61c674dd4746d4ce0"
+    )
 
     # HF Hub Credentials (required for Gated Models like LLaMa-2)
     hf_token: Union[str, Path] = Path(".hf_token")                      # Environment variable or Path to HF Token
 
     def __post_init__(self) -> None:
-        self.hf_token = self.hf_token.read_text().strip() if isinstance(self.hf_token, Path) else self.hf_token
+        if isinstance(self.hf_token, Path):
+            self.hf_token = self.hf_token.read_text().strip() if self.hf_token.exists() else None
 
     # fmt: on
 
@@ -123,12 +151,12 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     # Get `config.json`, 'dataset_statistics.json' and `checkpoint_pt` -- mirrors logic in `prismatic.models.load.py`
     if os.path.isdir(cfg.openvla_model_path_or_id):
         print(f"[*] Loading from Local Path `{(run_dir := Path(cfg.openvla_model_path_or_id))}`")
-        config_json, checkpoint_pt = run_dir / "config.json", run_dir / "checkpoints" / "latest-checkpoint.pt"
+        config_json, checkpoint_pt = run_dir / "config.json", resolve_local_prismatic_checkpoint(run_dir)
         dataset_statistics_json = run_dir / "dataset_statistics.json"
 
         assert config_json.exists(), f"Missing `config.json` for `{run_dir = }`"
-        assert checkpoint_pt.exists(), f"Missing checkpoint for `{run_dir = }`"
         assert dataset_statistics_json.exists(), f"Missing `dataset_statistics.json` for `{run_dir = }`"
+        print(f"[*] Using checkpoint `{checkpoint_pt}`")
     else:
         print(f"[*] Downloading Prismatic Checkpoint from HF Hub :: `TRI-ML/{cfg.openvla_model_path_or_id}`")
         config_json = hf_hub_download("openvla/openvla-dev", f"{cfg.openvla_model_path_or_id}/config.json")
@@ -162,8 +190,14 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     # Instantiate & Add Pad to Tokenizer =>> following `prismatic.models.materialize.get_llm_backbone_and_tokenizer`
     #   TODO (siddk) :: Implement batched generation -- in which case this should set `padding_side = "left"`!
     print("[*] Instantiating and Patching Tokenizer, LLM Config")
+    tokenizer_path_or_id = cfg.tokenizer_path_or_id or hf_config.hf_llm_id
+    print(f"[*] Loading tokenizer from `{tokenizer_path_or_id}`")
     tokenizer = AutoTokenizer.from_pretrained(
-        hf_config.hf_llm_id, model_max_length=hf_config.llm_max_length, token=cfg.hf_token, padding_side="right"
+        tokenizer_path_or_id,
+        model_max_length=hf_config.llm_max_length,
+        token=cfg.hf_token,
+        padding_side="right",
+        trust_remote_code=True,
     )
     tokenizer.add_special_tokens({"pad_token": "<PAD>"})
     tokenizer.init_kwargs.pop("add_prefix_space", None)  # Pop to prevent unnecessary warning on reload...
@@ -176,40 +210,45 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     hf_config.text_config.torch_dtype = torch.bfloat16
     assert hf_config.text_config.use_cache, "LLM config `use_cache` should be True for inference (set default)!"
 
-    # Create Vision Backbone & Transform =>> following `prismatic.models.materialize.get_vision_backbone_and_transform`
-    #   =>> Deviates a bit from existing code; as such, explicitly tested in `tests/test_image_transforms.py`
-    print("[*] Loading TIMM Vision Backbone(s) and Image Transform(s) =>> Initializing PrismaticImageProcessor")
-    input_sizes, interpolations, means, stds = [], [], [], []
-    for idx, timm_model_id in enumerate(hf_config.timm_model_ids):
-        timm_vision_backbone = timm.create_model(
-            timm_model_id,
-            pretrained=True,
-            num_classes=0,
-            img_size=hf_config.image_sizes[idx],
-            act_layer=hf_config.timm_override_act_layers[idx],
+    # Create PrismaticImageProcessor (`transformers.ImageProcessingMixin`).
+    # Prefer an existing local OpenVLA processor because building TIMM backbones here can trigger downloads and slow
+    # random initialization; the processor config is architecture metadata, not learned weights.
+    if cfg.image_processor_path_or_id is not None:
+        print(f"[*] Loading image processor from `{cfg.image_processor_path_or_id}`")
+        hf_image_processor = PrismaticImageProcessor.from_pretrained(cfg.image_processor_path_or_id)
+    else:
+        # Create Vision Backbone & Transform =>> following `prismatic.models.materialize.get_vision_backbone_and_transform`
+        print("[*] Loading TIMM Vision Backbone(s) and Image Transform(s) =>> Initializing PrismaticImageProcessor")
+        input_sizes, interpolations, means, stds = [], [], [], []
+        for idx, timm_model_id in enumerate(hf_config.timm_model_ids):
+            timm_vision_backbone = timm.create_model(
+                timm_model_id,
+                pretrained=False,
+                num_classes=0,
+                img_size=hf_config.image_sizes[idx],
+                act_layer=hf_config.timm_override_act_layers[idx],
+            )
+
+            # Get Per-Backbone Image Processing
+            data_cfg = timm.data.resolve_model_data_config(timm_vision_backbone)
+            input_sizes.append((3, hf_config.image_sizes[idx], hf_config.image_sizes[idx]))
+            interpolations.append(data_cfg["interpolation"])
+            means.append(data_cfg["mean"])
+            stds.append(data_cfg["std"])
+
+            # Patch `LayerScale` because of HF annoying `fix_key` overwrite...
+            for module in timm_vision_backbone.modules():
+                if isinstance(module, LayerScale):
+                    ls_apply_patch(module)
+
+        hf_image_processor = PrismaticImageProcessor(
+            use_fused_vision_backbone=hf_config.use_fused_vision_backbone,
+            image_resize_strategy=hf_config.image_resize_strategy,
+            input_sizes=input_sizes,
+            interpolations=interpolations,
+            means=means,
+            stds=stds,
         )
-
-        # Get Per-Backbone Image Processing
-        data_cfg = timm.data.resolve_model_data_config(timm_vision_backbone)
-        input_sizes.append((3, hf_config.image_sizes[idx], hf_config.image_sizes[idx]))
-        interpolations.append(data_cfg["interpolation"])
-        means.append(data_cfg["mean"])
-        stds.append(data_cfg["std"])
-
-        # Patch `LayerScale` because of HF annoying `fix_key` overwrite...
-        for module in timm_vision_backbone.modules():
-            if isinstance(module, LayerScale):
-                ls_apply_patch(module)
-
-    # Create PrismaticImageProcessor (`transformers.ImageProcessingMixin`)
-    hf_image_processor = PrismaticImageProcessor(
-        use_fused_vision_backbone=hf_config.use_fused_vision_backbone,
-        image_resize_strategy=hf_config.image_resize_strategy,
-        input_sizes=input_sizes,
-        interpolations=interpolations,
-        means=means,
-        stds=stds,
-    )
 
     # Create top-level PrismaticProcessor (`transformers.ProcessorMixin` =>> enables registry w/ AutoProcessor)
     print("[*] Creating PrismaticProcessor Instance from Tokenizer and PrismaticImageProcessor")

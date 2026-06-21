@@ -4,9 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-CKPT_PREFIX="/home/data/users/sjq/ckpts/spatial-memory-vla/"
-# DEFAULT_CKPT_PATH="/home/data/users/sjq/ckpts/spatial-memory-vla/31f090d05236101ebfc381b61c674dd4746d4ce0+libero_spatial_cotdep+b1+lr-5e-05+lora-r16+dropout-0.0+dit-l+gated-3d-memory--image_aug--gated_3d_memory_dit--50000_chkpt"
-CKPT_NAME="31f090d05236101ebfc381b61c674dd4746d4ce0+libero_spatial_cotdep+b1+lr-5e-05+lora-r16+dropout-0.0+dit-l+gated-3d-memory--image_aug--add_3d_memory_dit--75000_chkpt"
+CKPT_PREFIX="/home/data/users/sjq/ckpts/spatial-memory-diffusion/"
+CKPT_NAME="${CKPT_NAME:-31f090d05236101ebfc381b61c674dd4746d4ce0+libero_spatial_cotdep+b1+lr-5e-05+lora-r16+dropout-0.0+dit-l+vlm-diffusion--image_aug--memoryvla_form_no_memory_bank--90000_chkpt}"
 DEFAULT_CKPT_PATH="${CKPT_PREFIX}${CKPT_NAME}"
 
 CKPT_PATH="${CKPT_PATH:-${DEFAULT_CKPT_PATH}}"
@@ -15,11 +14,14 @@ PYTHON_BIN="${PYTHON_BIN:-/home/data/users/sjq/anaconda3/envs/spatial-memory-vla
 TASK_SUITE_NAME="${TASK_SUITE_NAME:-libero_spatial}"
 UNNORM_KEY="${UNNORM_KEY:-libero_spatial_cotdep}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-50}"
-NUM_OPEN_LOOP_STEPS="${NUM_OPEN_LOOP_STEPS:-8}"
+NUM_OPEN_LOOP_STEPS="${NUM_OPEN_LOOP_STEPS:-16}"
 NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-2}"
 USE_PROPRIO="${USE_PROPRIO:-True}"
 LORA_RANK="${LORA_RANK:-16}"
-RUN_ID_NOTE="${RUN_ID_NOTE:-spatial-memory-vla-libero-spatial}"
+RUN_ID_NOTE="${RUN_ID_NOTE:-memoryvla-form-no-memory-bank-libero-spatial}"
+ACTION_MODEL_TYPE="${ACTION_MODEL_TYPE:-DiT-L}"
+ACTION_DIFFUSION_STEPS="${ACTION_DIFFUSION_STEPS:-100}"
+NUM_DIFFUSION_STEPS_INFERENCE="${NUM_DIFFUSION_STEPS_INFERENCE:-10}"
 
 if [[ ! -d "${CKPT_PATH}" ]]; then
   echo "Checkpoint directory does not exist: ${CKPT_PATH}" >&2
@@ -59,8 +61,13 @@ echo "  log dir:    ${LOCAL_LOG_DIR}"
   --use_proprio "${USE_PROPRIO}" \
   --use_l1_regression False \
   --use_diffusion False \
+  --use_vlm_diffusion True \
   --center_crop True \
   --lora_rank "${LORA_RANK}" \
+  --action_model_type "${ACTION_MODEL_TYPE}" \
+  --action_diffusion_steps "${ACTION_DIFFUSION_STEPS}" \
+  --per_token_size 256 \
+  --num_diffusion_steps_inference "${NUM_DIFFUSION_STEPS_INFERENCE}" \
   --run_id_note "${RUN_ID_NOTE}" \
   --local_log_dir "${LOCAL_LOG_DIR}" \
   "$@"

@@ -17,8 +17,11 @@ from typing import Optional, Union
 import draccus
 import tqdm
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append(".")
+# Ensure imports resolve to this checkout, independent of the launch cwd.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) in sys.path:
+    sys.path.remove(str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
 from experiments.robot.aloha.aloha_utils import (
     get_aloha_env,
     get_aloha_image,

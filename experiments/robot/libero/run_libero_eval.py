@@ -18,6 +18,8 @@ import draccus
 import numpy as np
 import tqdm
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 
 def _configure_headless_rendering() -> None:
     """Configure LIBERO/MuJoCo before robosuite is imported."""
@@ -45,8 +47,12 @@ from libero.libero import benchmark
 
 import wandb
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("../..")
+# Ensure imports resolve to this spatial-memory-diffusion checkout, not another
+# project that may already be on PYTHONPATH.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) in sys.path:
+    sys.path.remove(str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -57,7 +63,9 @@ from experiments.robot.libero.libero_utils import (
 )
 from experiments.robot.openvla_utils import (
     get_action_head,
+    get_action_expert,
     get_noisy_action_projector,
+    get_per_compressor,
     get_processor,
     get_proprio_projector,
     resize_image_for_policy,
@@ -114,14 +122,18 @@ class GenerateConfig:
 
     use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
+    use_vlm_diffusion: bool = False                  # If True, uses VLM-conditioned DiT action expert
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_diffusion_steps_inference: int = 50          # (When `diffusion==True`) Number of diffusion steps used for inference
+    action_model_type: str = "DiT-L"                 # VLM diffusion action expert size: DiT-S, DiT-B, DiT-L
+    action_diffusion_steps: int = 100                # Diffusion steps used to train the DiT action expert
+    per_token_size: int = 256                        # MemoryVLA-style perceptual token compression size
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
-    num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
+    num_open_loop_steps: int = 16                    # Number of actions to execute open-loop before requerying policy
 
     lora_rank: int = 32                              # Rank of LoRA weight matrix (MAKE SURE THIS MATCHES TRAINING!)
 
@@ -162,6 +174,9 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    assert not (cfg.use_vlm_diffusion and (cfg.use_l1_regression or cfg.use_diffusion)), (
+        "VLM diffusion uses the DiT action expert and must not be combined with L1 or legacy diffusion heads."
+    )
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -186,6 +201,13 @@ def initialize_model(cfg: GenerateConfig):
     if cfg.use_l1_regression or cfg.use_diffusion:
         action_head = get_action_head(cfg, model.llm_dim)
 
+    # Load VLM-conditioned DiT action expert if needed
+    action_expert = None
+    per_compressor = None
+    if cfg.use_vlm_diffusion:
+        action_expert = get_action_expert(cfg, model.llm_dim)
+        per_compressor = get_per_compressor(cfg, model.vision_backbone.embed_dim)
+
     # Load noisy action projector if using diffusion
     noisy_action_projector = None
     if cfg.use_diffusion:
@@ -197,7 +219,7 @@ def initialize_model(cfg: GenerateConfig):
         processor = get_processor(cfg)
         check_unnorm_key(cfg, model)
 
-    return model, action_head, proprio_projector, noisy_action_projector, processor
+    return model, action_head, action_expert, per_compressor, proprio_projector, noisy_action_projector, processor
 
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
@@ -309,6 +331,8 @@ def run_episode(
     resize_size,
     processor=None,
     action_head=None,
+    action_expert=None,
+    per_compressor=None,
     proprio_projector=None,
     noisy_action_projector=None,
     initial_state=None,
@@ -360,6 +384,8 @@ def run_episode(
                     task_description,
                     processor=processor,
                     action_head=action_head,
+                    action_expert=action_expert,
+                    per_compressor=per_compressor,
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
@@ -393,6 +419,8 @@ def run_task(
     resize_size,
     processor=None,
     action_head=None,
+    action_expert=None,
+    per_compressor=None,
     proprio_projector=None,
     noisy_action_projector=None,
     total_episodes=0,
@@ -435,17 +463,19 @@ def run_task(
 
         # Run episode
         success, replay_images = run_episode(
-            cfg,
-            env,
-            task_description,
-            model,
-            resize_size,
-            processor,
-            action_head,
-            proprio_projector,
-            noisy_action_projector,
-            initial_state,
-            log_file,
+            cfg=cfg,
+            env=env,
+            task_description=task_description,
+            model=model,
+            resize_size=resize_size,
+            processor=processor,
+            action_head=action_head,
+            action_expert=action_expert,
+            per_compressor=per_compressor,
+            proprio_projector=proprio_projector,
+            noisy_action_projector=noisy_action_projector,
+            initial_state=initial_state,
+            log_file=log_file,
         )
 
         # Update counters
@@ -494,7 +524,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     set_seed_everywhere(cfg.seed)
 
     # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+    model, action_head, action_expert, per_compressor, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
@@ -513,18 +543,20 @@ def eval_libero(cfg: GenerateConfig) -> float:
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks)):
         total_episodes, total_successes = run_task(
-            cfg,
-            task_suite,
-            task_id,
-            model,
-            resize_size,
-            processor,
-            action_head,
-            proprio_projector,
-            noisy_action_projector,
-            total_episodes,
-            total_successes,
-            log_file,
+            cfg=cfg,
+            task_suite=task_suite,
+            task_id=task_id,
+            model=model,
+            resize_size=resize_size,
+            processor=processor,
+            action_head=action_head,
+            action_expert=action_expert,
+            per_compressor=per_compressor,
+            proprio_projector=proprio_projector,
+            noisy_action_projector=noisy_action_projector,
+            total_episodes=total_episodes,
+            total_successes=total_successes,
+            log_file=log_file,
         )
 
     # Calculate final success rate

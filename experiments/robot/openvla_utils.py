@@ -22,15 +22,18 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 # Apply JSON numpy patch for serialization
 json_numpy.patch()
 
+from action_model.action_model import ActionModel
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.models.memory_bank import BottleneckSE
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
+    NUM_ACTIONS_CHUNK,
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
@@ -39,7 +42,12 @@ DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 OPENVLA_IMAGE_SIZE = 224  # Standard image size expected by OpenVLA
-DEFAULT_BASE_VLA_PATH = "/home/data/huggingface/models--openvla--openvla-7b/snapshots/31f090d05236101ebfc381b61c674dd4746d4ce0"
+PRISMATIC_OPENVLA_PATH = "/home/data/huggingface/openvla-7b-prismatic"
+PRISMATIC_OPENVLA_HF_PATH = (
+    "/home/data/huggingface/models--openvla--openvla-7b/snapshots/"
+    "31f090d05236101ebfc381b61c674dd4746d4ce0"
+)
+DEFAULT_BASE_VLA_PATH = PRISMATIC_OPENVLA_PATH
 
 # Configure NumPy print settings
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
@@ -53,6 +61,34 @@ def model_is_on_hf_hub(model_path: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def resolve_prismatic_vla_path(vla_path: str) -> str:
+    """Resolve native Prismatic OpenVLA run dirs to the converted HF checkpoint dir expected by Transformers."""
+    path = Path(vla_path).expanduser()
+    if not path.is_dir():
+        return str(path)
+
+    has_hf_processor = (path / "preprocessor_config.json").exists() or (path / "processor_config.json").exists()
+    is_native_prismatic = (path / "checkpoints").is_dir() and (path / "config.json").exists() and not has_hf_processor
+    if not is_native_prismatic:
+        return str(path)
+
+    converted_path = (
+        Path(PRISMATIC_OPENVLA_HF_PATH)
+        if str(path) == PRISMATIC_OPENVLA_PATH
+        else Path(f"{str(path).rstrip('/')}-hf")
+    )
+    if converted_path.is_dir():
+        print(f"Resolved native Prismatic VLA path `{path}` to HF checkpoint `{converted_path}`")
+        return str(converted_path)
+
+    raise FileNotFoundError(
+        f"`{path}` is a native Prismatic OpenVLA run directory, but evaluation loads VLA weights through "
+        f"Transformers AutoModel/AutoProcessor. Convert it first:\n"
+        f"  python vla-scripts/extern/convert_openvla_weights_to_hf.py "
+        f"--openvla_model_path_or_id {path} --output_hf_model_local_path {converted_path}"
+    )
 
 
 def update_auto_map(pretrained_checkpoint: str) -> None:
@@ -262,8 +298,8 @@ def resolve_vla_load_path(checkpoint_path: str) -> Tuple[str, Optional[str]]:
     """Resolve the HF model path and optional LoRA adapter path for evaluation loading."""
     if os.path.isdir(checkpoint_path) and not os.path.isfile(os.path.join(checkpoint_path, "config.json")):
         if checkpoint_has_lora_adapter(checkpoint_path):
-            return DEFAULT_BASE_VLA_PATH, os.path.join(checkpoint_path, "lora_adapter")
-    return checkpoint_path, None
+            return resolve_prismatic_vla_path(DEFAULT_BASE_VLA_PATH), os.path.join(checkpoint_path, "lora_adapter")
+    return resolve_prismatic_vla_path(checkpoint_path), None
 
 
 def get_vla(cfg: Any) -> torch.nn.Module:
@@ -408,7 +444,8 @@ def get_processor(cfg: Any) -> AutoProcessor:
     Returns:
         AutoProcessor: The model's processor
     """
-    return AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+    vla_load_path, _ = resolve_vla_load_path(str(cfg.pretrained_checkpoint))
+    return AutoProcessor.from_pretrained(vla_load_path, trust_remote_code=True)
 
 
 def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioProjector:
@@ -536,6 +573,43 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         action_head.load_state_dict(state_dict)
 
     return action_head
+
+
+def get_action_expert(cfg: Any, llm_dim: int) -> ActionModel:
+    """Load the VLM-conditioned DiT action expert saved by finetune.py."""
+    per_token_size = getattr(cfg, "per_token_size", 256) if getattr(cfg, "use_vlm_diffusion", False) else llm_dim
+    action_expert = ActionModel(
+        token_size=llm_dim,
+        model_type=cfg.action_model_type,
+        in_channels=ACTION_DIM,
+        future_action_window_size=NUM_ACTIONS_CHUNK - 1,
+        diffusion_steps=cfg.action_diffusion_steps,
+        use_per_attn=True,
+        per_token_size=per_token_size,
+    )
+    action_expert = action_expert.to(torch.bfloat16).to(DEVICE)
+    action_expert.eval()
+
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_expert")
+    state_dict = load_component_state_dict(checkpoint_path)
+    action_expert.load_state_dict(state_dict)
+    action_expert.create_ddim(cfg.num_diffusion_steps_inference)
+
+    return action_expert
+
+
+def get_per_compressor(cfg: Any, vision_dim: int) -> BottleneckSE:
+    """Load the MemoryVLA-style perceptual token compressor saved by finetune.py."""
+    per_token_size = getattr(cfg, "per_token_size", 256)
+    per_compressor = BottleneckSE(C_in=vision_dim, C_mid=per_token_size * 2, C_out=per_token_size)
+    per_compressor = per_compressor.to(torch.bfloat16).to(DEVICE)
+    per_compressor.eval()
+
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "per_compressor")
+    state_dict = load_component_state_dict(checkpoint_path)
+    per_compressor.load_state_dict(state_dict)
+
+    return per_compressor
 
 
 def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, int]]) -> np.ndarray:
@@ -733,6 +807,110 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     return processed_images
 
 
+def gather_last_valid_vlm_token(
+    last_hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_patches: int,
+) -> torch.Tensor:
+    """Gather the MemoryVLA-style cog token after removing visual/proprio prefix tokens."""
+    last_hidden_states = last_hidden_states[:, num_patches:]
+    token_lengths = attention_mask.to(device=last_hidden_states.device).long().sum(dim=1).clamp(min=1)
+    hidden_indices = (token_lengths - 1).clamp(max=last_hidden_states.shape[1] - 1)
+    gather_indices = hidden_indices.view(-1, 1, 1).expand(-1, 1, last_hidden_states.shape[-1])
+    return last_hidden_states.gather(1, gather_indices)
+
+
+def compress_vision_features(
+    per_compressor: torch.nn.Module,
+    vision_feats: torch.Tensor,
+    tokens_per_image: int,
+) -> torch.Tensor:
+    """Apply MemoryVLA BottleneckSE per image and restore the original multi-image token order."""
+    if per_compressor is None:
+        raise ValueError("VLM diffusion with MemoryVLA-style per tokens requires per_compressor")
+
+    batch_size, num_tokens, channels = vision_feats.shape
+    if num_tokens % tokens_per_image != 0:
+        raise ValueError(f"Expected vision token count {num_tokens} to be divisible by {tokens_per_image}")
+
+    num_images = num_tokens // tokens_per_image
+    vision_feats = vision_feats.reshape(batch_size * num_images, tokens_per_image, channels)
+    per_tokens = per_compressor(vision_feats)
+    return per_tokens.reshape(batch_size, num_tokens, per_tokens.shape[-1])
+
+
+def predict_vlm_diffusion_action(
+    cfg: Any,
+    vla: torch.nn.Module,
+    action_expert: ActionModel,
+    per_compressor: torch.nn.Module,
+    inputs: Dict[str, torch.Tensor],
+    proprio: Optional[np.ndarray],
+    proprio_projector: Optional[torch.nn.Module],
+    use_film: bool,
+) -> np.ndarray:
+    """Sample an action chunk from the DiT action expert conditioned on VLM hidden states."""
+    output = vla(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        pixel_values=inputs["pixel_values"].to(torch.bfloat16),
+        labels=torch.full_like(inputs["input_ids"], -100),
+        output_hidden_states=True,
+        proprio=(
+            torch.as_tensor(proprio, device=inputs["input_ids"].device, dtype=torch.bfloat16)
+            if proprio is not None
+            else None
+        ),
+        proprio_projector=proprio_projector,
+        use_film=use_film,
+    )
+
+    num_perception_tokens = vla.vision_backbone.get_num_patches() * vla.vision_backbone.get_num_images_in_input()
+    num_patches = num_perception_tokens + (1 if proprio_projector is not None and proprio is not None else 0)
+    last_hidden_states = output.hidden_states[-1]
+    cog_tokens = gather_last_valid_vlm_token(
+        last_hidden_states=last_hidden_states,
+        attention_mask=inputs["attention_mask"],
+        num_patches=num_patches,
+    ).to(torch.bfloat16)
+    vision_feats = vla.vision_backbone(inputs["pixel_values"].to(torch.bfloat16)).to(torch.bfloat16)
+    per_tokens = compress_vision_features(
+        per_compressor=per_compressor,
+        vision_feats=vision_feats,
+        tokens_per_image=vla.vision_backbone.get_num_patches(),
+    )
+
+    noise = torch.randn(
+        size=(1, NUM_ACTIONS_CHUNK, ACTION_DIM),
+        device=next(action_expert.parameters()).device,
+        dtype=torch.bfloat16,
+    )
+    diffusion = action_expert.ddim_diffusion or action_expert.create_ddim(cfg.num_diffusion_steps_inference)
+    dit_dtype = next(action_expert.net.parameters()).dtype
+
+    def dit_model(x, t, z, per_token):
+        return action_expert.net(
+            x.to(dtype=dit_dtype),
+            t,
+            z.to(device=x.device, dtype=dit_dtype),
+            per_token=per_token.to(device=x.device, dtype=dit_dtype),
+        )
+
+    normalized_actions = diffusion.ddim_sample_loop(
+        dit_model,
+        shape=noise.shape,
+        noise=noise,
+        clip_denoised=True,
+        model_kwargs={"z": cog_tokens, "per_token": per_tokens},
+        device=noise.device,
+        progress=False,
+        eta=0.0,
+    )
+    normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM).float().cpu().numpy()
+
+    return vla._unnormalize_actions(normalized_actions, cfg.unnorm_key)
+
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -740,6 +918,8 @@ def get_vla_action(
     obs: Dict[str, Any],
     task_label: str,
     action_head: Optional[torch.nn.Module] = None,
+    action_expert: Optional[torch.nn.Module] = None,
+    per_compressor: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
@@ -799,7 +979,22 @@ def get_vla_action(
             proprio = obs["state"]
 
         # Generate action
-        if action_head is None:
+        if getattr(cfg, "use_vlm_diffusion", False):
+            if action_expert is None:
+                raise ValueError("cfg.use_vlm_diffusion=True requires an action_expert checkpoint")
+            if per_compressor is None:
+                raise ValueError("cfg.use_vlm_diffusion=True requires a per_compressor checkpoint")
+            action = predict_vlm_diffusion_action(
+                cfg=cfg,
+                vla=vla,
+                action_expert=action_expert,
+                per_compressor=per_compressor,
+                inputs=inputs,
+                proprio=proprio,
+                proprio_projector=proprio_projector if cfg.use_proprio else None,
+                use_film=use_film,
+            )
+        elif action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
             action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
         else:
