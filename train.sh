@@ -54,7 +54,7 @@ nohup torchrun --standalone --nnodes 1 --nproc-per-node 1 --master_addr "${MASTE
   --batch_size 1 \
   --learning_rate 5e-5 \
   --num_steps_before_decay 100000 \
-  --max_steps 100000 \
+  --max_steps 50000 \
   --save_freq 5000 \
   --save_latest_checkpoint_only False \
   --shuffle_buffer_size 32 \

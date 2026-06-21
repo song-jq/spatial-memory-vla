@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from experiments.robot.openvla_utils import (
+    get_spatial_memory_vla_action,
     get_vla,
     get_vla_action,
 )
@@ -103,6 +104,8 @@ def get_action(
     task_label: str,
     processor: Optional[Any] = None,
     action_head: Optional[torch.nn.Module] = None,
+    action_expert: Optional[torch.nn.Module] = None,
+    depth_memory_fusion: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
@@ -129,17 +132,32 @@ def get_action(
     """
     with torch.no_grad():
         if cfg.model_family == "openvla":
-            action = get_vla_action(
-                cfg=cfg,
-                vla=model,
-                processor=processor,
-                obs=obs,
-                task_label=task_label,
-                action_head=action_head,
-                proprio_projector=proprio_projector,
-                noisy_action_projector=noisy_action_projector,
-                use_film=use_film,
-            )
+            if getattr(cfg, "use_spatial_memory_diffusion", False):
+                if action_expert is None or depth_memory_fusion is None:
+                    raise ValueError("Spatial-memory eval requires action_expert and depth_memory_fusion.")
+                action = get_spatial_memory_vla_action(
+                    cfg=cfg,
+                    vla=model,
+                    processor=processor,
+                    obs=obs,
+                    task_label=task_label,
+                    depth_memory_fusion=depth_memory_fusion,
+                    action_expert=action_expert,
+                    proprio_projector=proprio_projector,
+                    use_film=use_film,
+                )
+            else:
+                action = get_vla_action(
+                    cfg=cfg,
+                    vla=model,
+                    processor=processor,
+                    obs=obs,
+                    task_label=task_label,
+                    action_head=action_head,
+                    proprio_projector=proprio_projector,
+                    noisy_action_projector=noisy_action_projector,
+                    use_film=use_film,
+                )
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")
 

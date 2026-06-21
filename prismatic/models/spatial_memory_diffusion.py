@@ -69,6 +69,8 @@ def coerce_depth_tensor(depth_maps, device: torch.device, dtype: torch.dtype) ->
         depth_maps = depth_maps.squeeze(-1)
     elif depth_maps.ndim == 4 and depth_maps.shape[1] == 1:
         depth_maps = depth_maps.squeeze(1)
+    elif depth_maps.ndim == 3 and depth_maps.shape[-1] == 1:
+        depth_maps = depth_maps.squeeze(-1).unsqueeze(0)
     elif depth_maps.ndim == 2:
         depth_maps = depth_maps.unsqueeze(0)
 

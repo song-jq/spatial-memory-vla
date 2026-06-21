@@ -22,15 +22,18 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 # Apply JSON numpy patch for serialization
 json_numpy.patch()
 
+from action_model.action_model import ActionModel
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
+from prismatic.models.spatial_memory_diffusion import DepthMemoryFusion
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
+    NUM_ACTIONS_CHUNK,
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
@@ -239,7 +242,7 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     Returns:
         Dict: The processed state dictionary for loading
     """
-    state_dict = torch.load(checkpoint_path, weights_only=True)
+    state_dict = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
 
     # If the component was trained with DDP, elements in the state dict have prefix "module." which we must remove
     new_state_dict = {}
@@ -538,6 +541,53 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     return action_head
 
 
+def _infer_depth_perception_fusion_type(state_dict: Dict[str, torch.Tensor], requested_type: str) -> str:
+    checkpoint_type = "gate" if any(k.startswith("depth_perception_gate.") for k in state_dict.keys()) else "add"
+    if requested_type != checkpoint_type:
+        print(
+            "WARNING: depth_perception_fusion_type="
+            f"{requested_type!r} does not match checkpoint state dict; using {checkpoint_type!r}."
+        )
+    return checkpoint_type
+
+
+def get_spatial_memory_modules(cfg: Any, llm_dim: int, num_perception_tokens: int) -> Tuple[DepthMemoryFusion, ActionModel]:
+    """Load the depth-memory fusion module and MemoryVLA-style action expert."""
+    depth_memory_fusion_path = find_checkpoint_file(cfg.pretrained_checkpoint, "depth_memory_fusion")
+    depth_memory_fusion_state_dict = load_component_state_dict(depth_memory_fusion_path)
+    depth_perception_fusion_type = _infer_depth_perception_fusion_type(
+        depth_memory_fusion_state_dict,
+        getattr(cfg, "depth_perception_fusion_type", "gate"),
+    )
+    depth_memory_fusion = DepthMemoryFusion(
+        llm_dim=llm_dim,
+        num_depth_tokens=num_perception_tokens,
+        depth_encoder_checkpoint=None,
+        dataloader_type=getattr(cfg, "memory_dataloader_type", "stream"),
+        group_size=getattr(cfg, "memory_group_size", 16),
+        mem_length=getattr(cfg, "mem_length", 16),
+        retrieval_layers=getattr(cfg, "retrieval_layers", 2),
+        use_timestep_pe=True,
+        depth_perception_fusion_type=depth_perception_fusion_type,
+    ).to(torch.bfloat16).to(DEVICE)
+    depth_memory_fusion.load_state_dict(depth_memory_fusion_state_dict)
+    depth_memory_fusion.eval()
+
+    action_expert = ActionModel(
+        token_size=llm_dim,
+        model_type=getattr(cfg, "action_model_type", "DiT-L"),
+        in_channels=ACTION_DIM,
+        future_action_window_size=NUM_ACTIONS_CHUNK - 1,
+        diffusion_steps=getattr(cfg, "action_diffusion_steps", 100),
+        use_per_attn=True,
+        per_token_size=llm_dim,
+    ).to(torch.bfloat16).to(DEVICE)
+    action_expert.load_state_dict(load_component_state_dict(find_checkpoint_file(cfg.pretrained_checkpoint, "action_expert")))
+    action_expert.eval()
+
+    return depth_memory_fusion, action_expert
+
+
 def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, int]]) -> np.ndarray:
     """
     Resize an image to match the policy's expected input size.
@@ -562,6 +612,142 @@ def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, 
     img = tf.cast(tf.clip_by_value(tf.round(img), 0, 255), tf.uint8)
 
     return img.numpy()
+
+
+def _unnormalize_action_chunk(vla: torch.nn.Module, normalized_actions: np.ndarray, unnorm_key: str) -> np.ndarray:
+    action_norm_stats = vla.get_action_stats(unnorm_key)
+    if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
+    elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+    else:
+        raise ValueError("Unsupported action/proprio normalization type detected!")
+
+    normalized_actions = np.clip(normalized_actions, -1, 1)
+    normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
+    return np.where(
+        mask,
+        0.5 * (normalized_actions + 1) * (action_high - action_low + 1e-8) + action_low,
+        normalized_actions,
+    )
+
+
+def _extract_spatial_memory_tokens(
+    vla: torch.nn.Module,
+    inputs: Dict[str, torch.Tensor],
+    proprio: Optional[np.ndarray],
+    proprio_projector: Optional[torch.nn.Module],
+    use_film: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the VLA once and return cognition and perception tokens for action expert inference."""
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    if not torch.all(input_ids[:, -1] == 29871):
+        input_ids = torch.cat(
+            (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
+        )
+        attention_mask = torch.cat(
+            (attention_mask, torch.ones((attention_mask.shape[0], 1), device=attention_mask.device, dtype=attention_mask.dtype)),
+            dim=1,
+        )
+
+    labels = input_ids.clone()
+    labels[:] = -100
+    input_ids, attention_mask = vla._prepare_input_for_action_prediction(input_ids, attention_mask)
+    labels = vla._prepare_labels_for_action_prediction(labels, input_ids)
+
+    proprio_tensor = None
+    if proprio_projector is not None and proprio is not None:
+        proprio_tensor = torch.as_tensor(proprio, device=DEVICE, dtype=torch.bfloat16)
+
+    output = vla(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=inputs["pixel_values"],
+        labels=labels,
+        output_hidden_states=True,
+        proprio=proprio_tensor,
+        proprio_projector=proprio_projector,
+        use_film=use_film,
+    )
+
+    last_hidden_states = output.hidden_states[-1]
+    num_perception_tokens = vla.vision_backbone.get_num_patches() * vla.vision_backbone.get_num_images_in_input()
+    num_patches = num_perception_tokens + (1 if proprio_tensor is not None else 0)
+
+    perception_tokens = last_hidden_states[:, 1 : 1 + num_perception_tokens].to(torch.bfloat16)
+    token_lengths = attention_mask.to(device=last_hidden_states.device).long().sum(dim=1).clamp(min=1)
+    hidden_indices = (token_lengths - 1 + num_patches).clamp(max=last_hidden_states.shape[1] - 1)
+    gather_indices = hidden_indices.view(-1, 1, 1).expand(-1, 1, last_hidden_states.shape[-1])
+    cog_tokens = last_hidden_states.gather(1, gather_indices).to(torch.bfloat16)
+    return cog_tokens, perception_tokens
+
+
+def _sample_action_expert(
+    action_expert: ActionModel,
+    cog_tokens: torch.Tensor,
+    memory_tokens: torch.Tensor,
+    cfg_scale: float,
+    use_ddim: bool,
+    num_ddim_steps: int,
+) -> np.ndarray:
+    model_dtype = next(action_expert.net.parameters()).dtype
+    cog_tokens = cog_tokens.to(dtype=model_dtype)
+    memory_tokens = memory_tokens.to(dtype=model_dtype)
+    batch_size = cog_tokens.shape[0]
+    noise = torch.randn(
+        batch_size,
+        NUM_ACTIONS_CHUNK,
+        action_expert.in_channels,
+        device=cog_tokens.device,
+        dtype=model_dtype,
+    )
+
+    using_cfg = cfg_scale > 1.0
+    if using_cfg:
+        noise = torch.cat([noise, noise], dim=0)
+        uncondition = action_expert.net.z_embedder.uncondition.unsqueeze(0).expand(batch_size, -1, -1).to(
+            device=cog_tokens.device, dtype=model_dtype
+        )
+        model_kwargs = {
+            "z": torch.cat([cog_tokens, uncondition], dim=0),
+            "cfg_scale": cfg_scale,
+            "per_token": memory_tokens.repeat(2, 1, 1),
+        }
+        sample_fn = action_expert.net.forward_with_cfg
+    else:
+        model_kwargs = {"z": cog_tokens, "per_token": memory_tokens}
+        sample_fn = action_expert.net.forward
+
+    if use_ddim:
+        if action_expert.ddim_diffusion is None:
+            action_expert.create_ddim(ddim_step=num_ddim_steps)
+        samples = action_expert.ddim_diffusion.ddim_sample_loop(
+            sample_fn,
+            noise.shape,
+            noise,
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            progress=False,
+            device=cog_tokens.device,
+            eta=0.0,
+        )
+    else:
+        samples = action_expert.diffusion.p_sample_loop(
+            sample_fn,
+            noise.shape,
+            noise,
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            progress=False,
+            device=cog_tokens.device,
+        )
+    if using_cfg:
+        samples, _ = samples.chunk(2, dim=0)
+    return samples[0].float().cpu().numpy()
 
 
 def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.Tensor:
@@ -733,6 +919,18 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     return processed_images
 
 
+def collect_policy_images(obs: Dict[str, Any], cfg: Any) -> List[np.ndarray]:
+    """Collect RGB policy images while excluding depth observations."""
+    images = [obs["full_image"]]
+    if cfg.num_images_in_input > 1:
+        images.extend(
+            obs[k]
+            for k in obs.keys()
+            if "wrist" in k and k.endswith("_image") and "depth" not in k
+        )
+    return images
+
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -764,9 +962,7 @@ def get_vla_action(
     with torch.inference_mode():
 
         # Collect all input images
-        all_images = [obs["full_image"]]
-        if cfg.num_images_in_input > 1:
-            all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
+        all_images = collect_policy_images(obs, cfg)
 
         # Process images
         all_images = prepare_images_for_vla(all_images, cfg)
@@ -817,6 +1013,67 @@ def get_vla_action(
 
     # Return action chunk as list of actions
     return [action[i] for i in range(len(action))]
+
+
+def get_spatial_memory_vla_action(
+    cfg: Any,
+    vla: torch.nn.Module,
+    processor: Any,
+    obs: Dict[str, Any],
+    task_label: str,
+    depth_memory_fusion: DepthMemoryFusion,
+    action_expert: ActionModel,
+    proprio_projector: Optional[torch.nn.Module] = None,
+    use_film: bool = False,
+) -> List[np.ndarray]:
+    """Generate actions through the spatial-memory depth fusion and DiT action expert."""
+    with torch.inference_mode():
+        all_images = collect_policy_images(obs, cfg)
+        all_images = prepare_images_for_vla(all_images, cfg)
+        primary_image = all_images.pop(0)
+
+        prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
+        inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
+        if all_images:
+            all_wrist_inputs = [
+                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
+            ]
+            inputs["pixel_values"] = torch.cat(
+                [inputs["pixel_values"]] + [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs],
+                dim=1,
+            )
+
+        proprio = None
+        if cfg.use_proprio:
+            proprio = obs["state"]
+            proprio_norm_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
+            proprio = normalize_proprio(proprio, proprio_norm_stats)
+
+        cog_tokens, perception_tokens = _extract_spatial_memory_tokens(
+            vla=vla,
+            inputs=inputs,
+            proprio=proprio,
+            proprio_projector=proprio_projector,
+            use_film=use_film,
+        )
+
+        memory_tokens = depth_memory_fusion(
+            perception_tokens=perception_tokens,
+            depth_maps=obs["depth_image"],
+            episode_ids=np.asarray([getattr(cfg, "_current_episode_id", 0)]),
+            timesteps=np.asarray([getattr(cfg, "_current_timestep", 0)]),
+        )
+        normalized_actions = _sample_action_expert(
+            action_expert=action_expert,
+            cog_tokens=cog_tokens,
+            memory_tokens=memory_tokens,
+            cfg_scale=getattr(cfg, "action_cfg_scale", 1.5),
+            use_ddim=getattr(cfg, "action_use_ddim", True),
+            num_ddim_steps=getattr(cfg, "action_ddim_steps", 10),
+        )
+        actions = _unnormalize_action_chunk(vla, normalized_actions, cfg.unnorm_key)
+
+    return [actions[i] for i in range(len(actions))]
 
 
 def get_action_from_server(

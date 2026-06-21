@@ -33,6 +33,7 @@ def get_libero_env(task, model_family, resolution=256):
         "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,
         "camera_widths": resolution,
+        "camera_depths": True,
         "has_renderer": False,
         "has_offscreen_renderer": True,
     }
@@ -52,14 +53,30 @@ def get_libero_image(obs):
     """Extracts third-person image from observations and preprocesses it."""
     img = obs["agentview_image"]
     img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
-    return img
+    return img.copy()
 
 
 def get_libero_wrist_image(obs):
     """Extracts wrist camera image from observations and preprocesses it."""
     img = obs["robot0_eye_in_hand_image"]
     img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
-    return img
+    return img.copy()
+
+
+def get_libero_depth_image(obs):
+    """Extract third-person depth from observations and preprocess it."""
+    if "agentview_depth" not in obs:
+        raise KeyError("Missing 'agentview_depth' in LIBERO observations.")
+    depth = obs["agentview_depth"][::-1, ::-1].copy()
+    return np.squeeze(depth, axis=-1) if depth.ndim == 3 and depth.shape[-1] == 1 else depth
+
+
+def get_libero_wrist_depth_image(obs):
+    """Extract wrist depth from observations and preprocess it."""
+    if "robot0_eye_in_hand_depth" not in obs:
+        raise KeyError("Missing 'robot0_eye_in_hand_depth' in LIBERO observations.")
+    depth = obs["robot0_eye_in_hand_depth"][::-1, ::-1].copy()
+    return np.squeeze(depth, axis=-1) if depth.ndim == 3 and depth.shape[-1] == 1 else depth
 
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):

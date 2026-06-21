@@ -45,12 +45,18 @@ from libero.libero import benchmark
 
 import wandb
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("../..")
+# Ensure imports resolve to this spatial-memory-vla checkout, not another
+# project that may already be on PYTHONPATH.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) in sys.path:
+    sys.path.remove(str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
 from experiments.robot.libero.libero_utils import (
+    get_libero_depth_image,
     get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
+    get_libero_wrist_depth_image,
     get_libero_wrist_image,
     quat2axisangle,
     save_rollout_video,
@@ -60,6 +66,7 @@ from experiments.robot.openvla_utils import (
     get_noisy_action_projector,
     get_processor,
     get_proprio_projector,
+    get_spatial_memory_modules,
     resize_image_for_policy,
 )
 from experiments.robot.robot_utils import (
@@ -114,6 +121,7 @@ class GenerateConfig:
 
     use_l1_regression: bool = True                   # If True, uses continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
+    use_spatial_memory_diffusion: bool = False       # If True, uses depth-memory fusion and MemoryVLA DiT action expert
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     num_diffusion_steps_inference: int = 50          # (When `diffusion==True`) Number of diffusion steps used for inference
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
@@ -124,6 +132,16 @@ class GenerateConfig:
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
 
     lora_rank: int = 32                              # Rank of LoRA weight matrix (MAKE SURE THIS MATCHES TRAINING!)
+    action_model_type: str = "DiT-L"                 # Spatial-memory action expert size
+    action_diffusion_steps: int = 100                # Spatial-memory action expert diffusion steps
+    action_use_ddim: bool = True                     # Use DDIM sampling for spatial-memory action expert
+    action_ddim_steps: int = 10                      # Number of DDIM inference steps
+    action_cfg_scale: float = 1.5                    # Classifier-free guidance scale for action expert
+    memory_dataloader_type: str = "stream"           # Memory bank mode used during training
+    memory_group_size: int = 16                      # Memory bank group size
+    mem_length: int = 16                             # Memory bank length
+    retrieval_layers: int = 2                        # Memory retrieval layers
+    depth_perception_fusion_type: str = "gate"       # Depth/perception fusion type used by checkpoint
 
     unnorm_key: Union[str, Path] = ""                # Action un-normalization key
 
@@ -162,6 +180,9 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    assert not (cfg.use_spatial_memory_diffusion and (cfg.use_l1_regression or cfg.use_diffusion)), (
+        "Spatial-memory diffusion eval uses action_expert and cannot be combined with legacy action heads."
+    )
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -191,13 +212,20 @@ def initialize_model(cfg: GenerateConfig):
     if cfg.use_diffusion:
         noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
 
+    # Load spatial-memory action expert path if needed
+    depth_memory_fusion = None
+    action_expert = None
+    if cfg.use_spatial_memory_diffusion:
+        num_perception_tokens = model.vision_backbone.get_num_patches() * cfg.num_images_in_input
+        depth_memory_fusion, action_expert = get_spatial_memory_modules(cfg, model.llm_dim, num_perception_tokens)
+
     # Get OpenVLA processor if needed
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
         check_unnorm_key(cfg, model)
 
-    return model, action_head, proprio_projector, noisy_action_projector, processor
+    return model, action_head, action_expert, depth_memory_fusion, proprio_projector, noisy_action_projector, processor
 
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
@@ -271,6 +299,8 @@ def prepare_observation(obs, resize_size):
     # Get preprocessed images
     img = get_libero_image(obs)
     wrist_img = get_libero_wrist_image(obs)
+    depth_img = get_libero_depth_image(obs)
+    wrist_depth_img = get_libero_wrist_depth_image(obs)
 
     # Resize images to size expected by model
     img_resized = resize_image_for_policy(img, resize_size)
@@ -280,6 +310,8 @@ def prepare_observation(obs, resize_size):
     observation = {
         "full_image": img_resized,
         "wrist_image": wrist_img_resized,
+        "depth_image": depth_img,
+        "wrist_depth_image": wrist_depth_img,
         "state": np.concatenate(
             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
         ),
@@ -309,6 +341,8 @@ def run_episode(
     resize_size,
     processor=None,
     action_head=None,
+    action_expert=None,
+    depth_memory_fusion=None,
     proprio_projector=None,
     noisy_action_projector=None,
     initial_state=None,
@@ -325,6 +359,8 @@ def run_episode(
         obs = env.get_observation()
 
     # Initialize action queue
+    if depth_memory_fusion is not None and hasattr(depth_memory_fusion, "memory_bank"):
+        depth_memory_fusion.memory_bank.reset()
     if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
         print(f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
               f"({NUM_ACTIONS_CHUNK}) constant defined in prismatic.vla.constants! For best performance (in terms of "
@@ -352,6 +388,8 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
+                cfg._current_episode_id = id(env)
+                cfg._current_timestep = t - cfg.num_steps_wait
                 # Query model to get action
                 actions = get_action(
                     cfg,
@@ -360,6 +398,8 @@ def run_episode(
                     task_description,
                     processor=processor,
                     action_head=action_head,
+                    action_expert=action_expert,
+                    depth_memory_fusion=depth_memory_fusion,
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
@@ -393,6 +433,8 @@ def run_task(
     resize_size,
     processor=None,
     action_head=None,
+    action_expert=None,
+    depth_memory_fusion=None,
     proprio_projector=None,
     noisy_action_projector=None,
     total_episodes=0,
@@ -442,6 +484,8 @@ def run_task(
             resize_size,
             processor,
             action_head,
+            action_expert,
+            depth_memory_fusion,
             proprio_projector,
             noisy_action_projector,
             initial_state,
@@ -494,7 +538,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     set_seed_everywhere(cfg.seed)
 
     # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+    model, action_head, action_expert, depth_memory_fusion, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
@@ -520,6 +564,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             resize_size,
             processor,
             action_head,
+            action_expert,
+            depth_memory_fusion,
             proprio_projector,
             noisy_action_projector,
             total_episodes,
